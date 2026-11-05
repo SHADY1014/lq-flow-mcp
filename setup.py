@@ -84,15 +84,14 @@ def write_env(host: str, port: int, database: str, user: str, password: str) -> 
 
 def print_register() -> None:
     here = Path(__file__).resolve().with_name("server.py")
-    print("\n下一步：把 MCP 注册到 ZCode")
-    print("编辑 ~/.zcode/cli/config.json，在 mcp.servers 下加入：\n")
+    print("\n下一步：把 MCP 注册到你的 Agent 客户端（Claude Desktop / WorkBuddy / Cursor / ZCode 等）")
+    print("在客户端的 MCP 配置里加入：\n")
     print(f'''  "lq-flow": {{
-    "type": "stdio",
     "command": "python3",
-    "args": ["{here}"],
-    "timeoutMs": 600000
+    "args": ["{here}"]
   }}''')
-    print("\n保存后重启 ZCode，对 agent 说「跑一下 preflight」即可验证。")
+    print("\n如果客户端要求，再补 \"type\": \"stdio\" 和 \"timeoutMs\": 600000。")
+    print("保存后重启客户端，对 agent 说「跑一下 preflight」即可验证。")
 
 
 def main() -> int:

@@ -1,6 +1,6 @@
 # lq-flow MCP —— 漓泉 cERP 货物流向网关
 
-把公司 ERP 的取数和导出能力封装成 MCP 工具，装一次就能在 ZCode 里用自然语言取数。
+把公司 ERP 的取数和导出能力封装成 MCP 工具，装一次就能在你的 agent 里用自然语言取数。
 
 **第一次安装请按下面 4 步走**，不要跳过第 2 步。
 
@@ -47,20 +47,26 @@ python3 setup.py
 python3 setup.py --check
 ```
 
-## 3. 注册到 ZCode
+## 3. 注册到你的 Agent 客户端
 
-编辑 `~/.zcode/cli/config.json`，在 `mcp.servers` 下加入（路径按实际安装位置改）：
+任何支持 stdio 的 MCP 客户端都能用（Claude Desktop、WorkBuddy、Cursor、ZCode、Cherry Studio 等）。
+在客户端的 MCP 配置里加入（路径按实际安装位置改）：
 
 ```json
 "lq-flow": {
-  "type": "stdio",
   "command": "python3",
-  "args": ["/Users/<你的用户名>/lq-flow-mcp/server.py"],
-  "timeoutMs": 600000
+  "args": ["/Users/<你的用户名>/lq-flow-mcp/server.py"]
 }
 ```
 
-保存后**重启 ZCode**。
+常见位置：
+
+- Claude Desktop：`~/Library/Application Support/Claude/claude_desktop_config.json` 的 `mcpServers`
+- WorkBuddy / Cursor / ZCode：各自「设置 → MCP Servers」里粘贴上面的配置
+- 其他客户端：找到 MCP servers 配置项，按同样字段添加即可
+
+两点差异要注意：有的客户端需要额外的 `"type": "stdio"`；有的用 `timeoutMs` 控制单次超时，
+批量导出建议设到 **600000**（10 分钟）以上。保存后重启客户端。
 
 ## 4. 验证
 
