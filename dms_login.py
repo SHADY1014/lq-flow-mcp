@@ -30,19 +30,27 @@ PROFILE_DIR = Path.home() / ".lq-dms-chrome"
 HOST_HINT = "192.168.199.26"
 
 
-def find_chrome() -> str | None:
+def find_browser() -> str | None:
+    """Chrome / Edge / Chromium 都支持 CDP，任选其一即可。"""
     candidates = [
+        # Chrome
         "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
         r"C:\Program Files\Google\Chrome\Application\chrome.exe",
         r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
         os.path.expandvars(r"%LOCALAPPDATA%\Google\Chrome\Application\chrome.exe"),
         "/usr/bin/google-chrome",
+        # Edge
+        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+        # Chromium
         "/usr/bin/chromium",
     ]
     for c in candidates:
         if c and Path(c).exists():
             return c
-    return shutil.which("google-chrome") or shutil.which("chrome")
+    return (shutil.which("google-chrome") or shutil.which("chrome")
+            or shutil.which("msedge") or shutil.which("microsoft-edge"))
 
 
 def free_port(start: int = 9222) -> int:
@@ -70,9 +78,9 @@ def main() -> int:
     ap.add_argument("--out", default=str(COOKIE_OUT))
     args = ap.parse_args()
 
-    chrome = find_chrome()
+    chrome = find_browser()
     if not chrome:
-        print("✗ 没找到 Chrome，请安装或手动登录后复制 Cookie")
+        print("✗ 没找到 Chrome / Edge，安装其一后重试")
         return 2
 
     port = args.port or free_port()
