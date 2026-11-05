@@ -20,23 +20,10 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 FILES = ["server.py", "setup.py", "install.py", "requirements.txt",
-         "regions.json", "reports_catalog.json"]
+         "regions.json", "reports_catalog.json", "install.bat", "install.command"]
 PKG_DIR = "lq-flow-mcp"
 
-BAT = r"""@echo off
-chcp 65001 >nul
-cd /d "%~dp0"
-where py >nul 2>nul && (py -3 install.py) || (python install.py)
-echo.
-pause
-"""
 
-SH = """#!/bin/bash
-cd "$(dirname "$0")" || exit 1
-python3 install.py
-echo
-read -r -p "按回车关闭窗口" _
-"""
 
 README = """漓泉 cERP MCP 懒人包
 ========================
@@ -101,9 +88,7 @@ def main() -> int:
         "LQ_OUT_DIR=\n", encoding="utf-8")
     os.chmod(stage / ".lq-flow.env", 0o600)
 
-    (stage / "install.bat").write_text(BAT, encoding="utf-8-sig")
     sh = stage / "install.command"
-    sh.write_text(SH, encoding="utf-8")
     os.chmod(sh, os.stat(sh).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     (stage / "README.txt").write_text(README, encoding="utf-8")
 

@@ -94,6 +94,9 @@ python3 install.py
 扫描本机和佳客户端 ini 自动取账号 → 找不到就提示手工输入数据库账号。
 配置成功后继续自动注册客户端并做连通性检查。
 
+也可以 clone 之后直接双击 `install.bat`（Windows）或 `install.command`（macOS），
+效果等同于 `python3 install.py`。
+
 如果只想手工控制每一步，跳过 `install.py`，按上面「1. 安装依赖 → 4. 验证」走即可。
 
 ## 内部懒人包（给同事用，零配置）
