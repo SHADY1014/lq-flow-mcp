@@ -1057,6 +1057,100 @@ def dms_flow_report(year: int, month: int, day: int | None = None,
             "total": total}
 
 
+
+# ---------------------------------------------------------------- OA 协同办公
+OA_BASE = os.getenv("LQ_OA_BASE", "https://oa.lqp9.cn")
+OA_SESSION = Path.home() / ".lq-oa.cookie"
+
+
+def _oa_session() -> dict:
+    if not OA_SESSION.exists():
+        return {}
+    try:
+        return json.loads(OA_SESSION.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _oa_service(service: str, params: dict | None = None, timeout: int = 30) -> dict:
+    """调用 OA 的 /exoa/services（只认 HEADER 里的 token，不需要 Cookie）。"""
+    import urllib.parse
+    import urllib.request
+
+    data = _oa_session()
+    token = data.get("token", "")
+    if not token:
+        raise RuntimeError("没有 OA 会话，先运行 python3 oa_login.py")
+    qs = urllib.parse.urlencode({
+        "SERVICE": service,
+        "HEADER": json.dumps({"device_id": "PC", "token": token}, ensure_ascii=False),
+        "PARAMS": json.dumps(params or {}, ensure_ascii=False),
+    }, quote_via=urllib.parse.quote)
+    req = urllib.request.Request(f"{OA_BASE}/exoa/services?{qs}",
+                                 headers={"User-Agent": "Mozilla/5.0 (lq-flow-mcp)"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        text = r.read().decode("utf-8", "replace")
+    try:
+        return json.loads(text)
+    except Exception:
+        return {"_raw": text[:2000]}
+
+
+@mcp.tool()
+def oa_status() -> dict:
+    """检查 OA 会话是否有效（token 由 oa_login.py 手动登录生成）。"""
+    data = _oa_session()
+    if not data.get("token"):
+        return {"logged_in": False, "advice": "运行 python3 oa_login.py，在弹出的浏览器里登录一次"}
+    try:
+        res = _oa_service("OA.MenuService.getAllRooMenusOfUser")
+        menus = (res.get("RESULTS") or {}).get("list") or []
+        return {"logged_in": bool(menus), "user": data.get("user", ""),
+                "user_code": data.get("user_code", ""), "saved_at": data.get("saved_at"),
+                "top_menus": [m.get("name") for m in menus][:10],
+                "advice": "会话有效" if menus else "会话可能失效，重跑 oa_login.py"}
+    except Exception as exc:  # noqa: BLE001
+        return {"logged_in": False, "error": str(exc)[:150], "advice": "会话失效，重跑 oa_login.py"}
+
+
+@mcp.tool()
+def oa_menu(keyword: str | None = None, limit: int = 300) -> dict:
+    """OA 菜单树（扁平化）。keyword 按名称/编码过滤。"""
+    res = _oa_service("OA.MenuService.getAllRooMenusOfUser")
+    roots = (res.get("RESULTS") or {}).get("list") or []
+    items: list[dict] = []
+
+    def walk(node, parent=""):
+        for m in node or []:
+            name = (m.get("name") or "").strip()
+            items.append({"名称": name, "编码": (m.get("code") or "").strip(),
+                          "id": m.get("id"), "上级": parent,
+                          "地址": (m.get("viewUrl") or "").split("?")[0]})
+            walk(m.get("subMenus"), name)
+
+    walk(roots)
+    kw = (keyword or "").strip()
+    if kw:
+        items = [x for x in items if kw in x["名称"] or kw in x["编码"]]
+    return {"count": len(items), "menus": items[:max(1, min(limit, 500))]}
+
+
+@mcp.tool()
+def oa_services(service: str, params: str = "") -> dict:
+    """调用任意 OA 服务，如 "OA.UserAddressBookService.getUserByUserId"。
+
+    params 为 JSON 字符串（如 {"userId": "jiangkaihao"}）。
+    """
+    try:
+        p = json.loads(params) if params else {}
+    except Exception:
+        return {"ok": False, "error": "params 不是合法 JSON"}
+    try:
+        return {"ok": True, "service": service, "result": _oa_service(service, p)}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)[:200]}
+
+
 @mcp.tool()
 def run_report_proc(proc: str, param: str = " 3=3 ",
                     limit: int = 200, offset: int = 0) -> dict:

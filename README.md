@@ -144,6 +144,9 @@ MCP 侧对应工具：
 | `dms_status()` | 会话是否有效 |
 | `dms_fetch(path, params, save_to?)` | 带 Cookie 请求网页接口（如 `servlet/DataSetQueryServlet`） |
 | `dms_flow_report(year, month, day?, dept_code?, out_dir?, file_name?)` | 导出网页版「二级货物流向明细表」（BIRT，按月/日、按办事处） |
+| `oa_status()` | OA 会话是否有效 |
+| `oa_menu(keyword?, limit?)` | OA 菜单树（扁平化） |
+| `oa_services(service, params?)` | 调用任意 OA 服务（`/exoa/services`） |
 
 网页版流向报表链路（已验证）：
 
@@ -156,6 +159,25 @@ GET  http://192.168.199.26:9095/hjreport/frameset?__report=...&__format=xls&repo
 
 `reportArg` 是**明文 SQL**（不是 base64），页面里的 `<br/>` 要换成换行符；
 `__format=xls` 才是导出，`spreadsheet` 会回落成 HTML。
+
+### OA 协同办公（token 会话）
+
+```bash
+python3 oa_login.py
+```
+
+弹出的浏览器里登录一次即可。OA 的服务接口 `/exoa/services` **只认 HEADER 里的 token**
+（`localStorage.UserInfo.SESS_GUID`），不需要 Cookie，所以只保存 token 到 `~/.lq-oa.cookie`（600）。
+
+示例：
+
+```
+oa_status()
+oa_menu(keyword="公文")
+oa_services("OA.UserAddressBookService.getUserByUserId", '{"userId":"jiangkaihao"}')
+```
+
+token 随 OA 会话过期，失效时 `oa_status()` 会提示重跑 `oa_login.py`。
 
 ## 工具清单
 
