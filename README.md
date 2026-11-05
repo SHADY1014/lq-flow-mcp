@@ -125,6 +125,25 @@ ZCode / Claude Desktop / Cursor → 做一次 1433 连通性检查。
 如果对方**没装经销商系统客户端**也没关系：懒人包不依赖客户端，账号已在包里；
 想换账号则删掉 `~/.lq-flow.env` 后运行 `python3 setup.py`（支持从客户端 ini 自动提取）。
 
+
+### DMS 网页版会话（手动登录一次）
+
+网页版有验证码，无法自动登录，但可以手动登录一次后复用会话：
+
+```bash
+python3 dms_login.py
+```
+
+弹出独立 Chrome 窗口 → 你登录 → 脚本通过调试协议读取 Cookie（含 HttpOnly），
+保存到 `~/.lq-dms.cookie`（600 权限），然后自动关闭浏览器。会话失效后重跑一次即可。
+
+MCP 侧对应工具：
+
+| 工具 | 说明 |
+|---|---|
+| `dms_status()` | 会话是否有效 |
+| `dms_fetch(path, params, save_to?)` | 带 Cookie 请求网页接口（如 `servlet/DataSetQueryServlet`） |
+
 ## 工具清单
 
 | 工具 | 用途 |

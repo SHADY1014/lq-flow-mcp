@@ -866,6 +866,85 @@ def refresh_regions(apply: bool = False, months: int = 3) -> dict:
     return {"ok": True, "changed": len(plan), "added": plan, "file": str(path)}
 
 
+
+# ---------------------------------------------------------------- DMS 网页版（Cookie 会话）
+DMS_BASE = os.getenv("LQ_DMS_BASE", "http://192.168.199.26:9090/hjerp")
+DMS_COOKIE = Path.home() / ".lq-dms.cookie"
+
+
+def _dms_cookie_header() -> str | None:
+    if not DMS_COOKIE.exists():
+        return None
+    try:
+        data = json.loads(DMS_COOKIE.read_text(encoding="utf-8"))
+        cookies = data.get("cookies") or []
+        return "; ".join(f"{c['name']}={c['value']}" for c in cookies) or None
+    except Exception:
+        return None
+
+
+@mcp.tool()
+def dms_status() -> dict:
+    """检查 DMS 网页版登录会话是否有效（Cookie 由 dms_login.py 手动登录生成）。"""
+    import urllib.request
+
+    if not DMS_COOKIE.exists():
+        return {"logged_in": False,
+                "advice": "未找到会话：运行 python3 dms_login.py，在弹出的浏览器里登录一次"}
+    header = _dms_cookie_header()
+    try:
+        req = urllib.request.Request(f"{DMS_BASE}/indexServlet", headers={"Cookie": header or ""})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            ok = r.status == 200 and len(r.read(200)) > 0
+        saved = json.loads(DMS_COOKIE.read_text(encoding="utf-8")).get("saved_at")
+        return {"logged_in": ok, "base": DMS_BASE, "saved_at": saved,
+                "advice": "会话有效" if ok else "会话已失效，重新运行 python3 dms_login.py"}
+    except Exception as exc:  # noqa: BLE001
+        return {"logged_in": False, "base": DMS_BASE, "error": str(exc)[:150],
+                "advice": "会话失效或网络不通；重新运行 dms_login.py"}
+
+
+@mcp.tool()
+def dms_fetch(path: str, params: str = "", save_to: str = "", limit: int = 200000) -> dict:
+    """带登录 Cookie 请求 DMS 网页接口。
+
+    path 例如 "servlet/DataSetQueryServlet"；params 为查询串（a=1&b=2）。
+    返回文本/JSON；若响应是二进制（如 xlsx），需给 save_to 保存到文件。
+    """
+    import urllib.parse
+    import urllib.request
+
+    header = _dms_cookie_header()
+    if not header:
+        return {"ok": False, "error": "没有会话 Cookie，先运行 python3 dms_login.py"}
+    url = f"{DMS_BASE}/{path.lstrip('/')}"
+    if params:
+        url += ("&" if "?" in url else "?") + params.lstrip("?")
+    req = urllib.request.Request(url, headers={"Cookie": header})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            ctype = r.headers.get("Content-Type", "")
+            raw = r.read(limit)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)[:200], "url": url}
+
+    if any(k in ctype.lower() for k in ("excel", "spreadsheet", "octet-stream")) or path.lower().endswith("export"):
+        if not save_to:
+            return {"ok": False, "error": "响应是二进制，请提供 save_to", "content_type": ctype}
+        out = Path(save_to).expanduser()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(raw)
+        return {"ok": True, "saved": str(out), "bytes": len(raw), "content_type": ctype}
+
+    text = raw.decode("utf-8", "replace")
+    result = {"ok": True, "content_type": ctype, "bytes": len(raw), "url": url}
+    try:
+        result["json"] = json.loads(text)
+    except Exception:
+        result["text"] = text[:4000]
+    return result
+
+
 @mcp.tool()
 def run_report_proc(proc: str, param: str = " 3=3 ",
                     limit: int = 200, offset: int = 0) -> dict:
