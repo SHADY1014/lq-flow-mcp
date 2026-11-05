@@ -91,6 +91,8 @@ python3 setup.py --check
 | `report_catalog(keyword?, kind?, only_exportable?)` | **经销商系统全部报表目录**（按系统菜单，不预设业务口径） |
 | `report_detail(name_or_id)` | 单个报表的登记信息 + 数据源字段 |
 | `export_catalog_table(table_id, where?, out_path)` | 按目录导出某张报表数据表（受白名单约束） |
+| `check_office_changes(months?)` | 对比近 N 个月实际出库办事处与 regions.json，列出新增/消失/改名 |
+| `refresh_regions(apply?, months?)` | 把新增办事处补进 regions.json（默认 dry-run） |
 
 ### 报表目录
 
@@ -132,6 +134,18 @@ export_status("job_id")
 - 整个大区/全省：可能 3–5 分钟，**用 `flow_export_async`**，拿到 `job_id` 后轮询 `export_status`，不会因为调用太久被中断。
 
 ---
+
+## 办事处变更
+
+办事处代码/名称调整后，不需要手工改 `regions.json`：
+
+1. `preflight()` 会**自动比对**近 3 个月实际出库的办事处，发现变化会在 `office_changes` 里提示；
+2. `check_office_changes(3)` 看明细：新增 / 消失 / 改名（作废、虚拟、测试类代码自动忽略）；
+3. 确认后 `refresh_regions(apply=True)` 写入：新增项会补到「分公司=待确认、大区=待确认」，
+   需要人工补上真实大区，`region="广西"` 这类过滤才会包含它。
+
+权威源说明：以**近 N 个月有实际出库的 `zone_id`** 为准，名称取 `ctlm1003`。
+ERP 的 `invalid_flag` 不可靠（大量作废代码仍为 0），所以不用它判断。
 
 ## 常见问题
 

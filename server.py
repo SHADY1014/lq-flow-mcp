@@ -764,6 +764,101 @@ def export_catalog_table(table_id: str, where: str = "", out_path: str = "",
             "source": src, "match": item.get("匹配方式")}
 
 
+
+# ---------------------------------------------------------------- 办事处变更检测/同步
+def _erp_active_offices(months: int = 3) -> dict[str, str]:
+    """近 N 个月出库数据里实际出现的办事处 -> 名称（名称取 ctlm1003）。"""
+    conn = _connect(timeout=600)
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """select distinct rtrim(zone_id) as code
+               from cinvout_02 with(nolock)
+               where sts_flag='S'
+                 and out_time >= dateadd(month, -%s, getdate())
+                 and rtrim(isnull(zone_id,'')) <> ''""", (int(months),))
+        codes = [r[0] for r in cur.fetchall()]
+        cur.execute("""select rtrim(dept_id), rtrim(dept_name), rtrim(isnull(sdept_id,''))
+                       from ctlm1003 with(nolock) where len(rtrim(dept_id))=6""")
+        info = {r[0]: {"name": r[1], "parent": r[2]} for r in cur.fetchall()}
+        return {c: info.get(c, {}).get("name", "") for c in codes}
+    finally:
+        conn.close()
+
+
+_VOID_PAT = re.compile(r"作废|失效|停用|虚拟|测试|已删除")
+
+
+def _is_void(name: str) -> bool:
+    return bool(_VOID_PAT.search(name or ""))
+
+
+def _json_offices() -> dict[str, dict]:
+    out = {}
+    for comp, dq, o in _iter_offices():
+        code = str(o.get("ERP代码") or "").strip()
+        if code:
+            out[code] = {"名称": o["名称"], "分公司": comp, "大区": dq}
+    return out
+
+
+@mcp.tool()
+def check_office_changes(months: int = 3) -> dict:
+    """对比「近 N 个月实际出库的办事处」与 regions.json，列出新增/消失/改名。
+
+    办事处代码调整后先跑这个；需要写入用 refresh_regions(apply=True)。
+    """
+    erp = _erp_active_offices(months)
+    js = _json_offices()
+    raw_new = sorted(set(erp) - set(js))
+    new = [c for c in raw_new if not _is_void(erp.get(c, ""))]
+    ignored = [c for c in raw_new if _is_void(erp.get(c, ""))]
+    gone = sorted(set(js) - set(erp))
+    renamed = [
+        {"代码": c, "原名称": js[c]["名称"], "ERP名称": erp[c]}
+        for c in sorted(set(erp) & set(js))
+        if erp[c] and _norm(erp[c]) != _norm(js[c]["名称"])
+    ]
+    return {
+        "对比月份数": months,
+        "ERP出库办事处数": len(erp),
+        "regions.json办事处数": len(js),
+        "新增": [{"代码": c, "名称": erp[c]} for c in new],
+        "忽略的作废代码数": len(ignored),
+        "消失": [{"代码": c, "名称": js[c]["名称"], "分公司": js[c]["分公司"], "大区": js[c]["大区"]} for c in gone],
+        "改名": renamed,
+        "结论": "无变化" if not (new or gone or renamed) else "有变化，确认后执行 refresh_regions(apply=True)",
+    }
+
+
+@mcp.tool()
+def refresh_regions(apply: bool = False, months: int = 3) -> dict:
+    """把新增办事处补进 regions.json。
+
+    apply=False 只返回将写入的内容；apply=True 才落盘（新增项分公司/大区标为「待确认」，
+    需人工补大区归属后再用于 region 过滤）。
+    """
+    erp = _erp_active_offices(months)
+    js = _json_offices()
+    new = [c for c in sorted(set(erp) - set(js)) if not _is_void(erp.get(c, ""))]
+    if not new:
+        return {"ok": True, "changed": 0, "message": "没有新增办事处，无需写入"}
+    plan = [{"代码": c, "名称": erp[c], "分公司": "待确认", "大区": "待确认"} for c in new]
+    if not apply:
+        return {"ok": True, "changed": 0, "dry_run": True, "will_add": plan}
+    path = REGIONS_FILE
+    data = json.loads(path.read_text(encoding="utf-8"))
+    bucket = data.setdefault("分公司", {}).setdefault("待确认", {}).setdefault("大区", {}).setdefault("待确认", [])
+    existing = {str(x.get("ERP代码")) for x in bucket}
+    for item in plan:
+        if item["代码"] not in existing:
+            bucket.append({"名称": item["名称"], "OA部门编码": "", "ERP代码": item["代码"]})
+    data["更新时间"] = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    data["说明"] = (data.get("说明") or "") + "；新增办事处自动补充，分公司/大区待人工确认"
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    return {"ok": True, "changed": len(plan), "added": plan, "file": str(path)}
+
+
 @mcp.tool()
 def run_report_proc(proc: str, param: str = " 3=3 ",
                     limit: int = 200, offset: int = 0) -> dict:
@@ -867,6 +962,16 @@ def preflight() -> dict:
         result["db_reachable"] = True
         result["advice"] = ("正常，可以取数" if result["tunnels"]
                             else "正常（未检测到本机 VPN 隧道，走了路由器/旁路由转发）")
+        try:
+            chk = check_office_changes(3)
+            result["office_changes"] = {
+                "新增": len(chk["新增"]), "消失": len(chk["消失"]), "改名": len(chk["改名"]),
+                "明细": chk["新增"][:10],
+            }
+            if chk["新增"] or chk["消失"] or chk["改名"]:
+                result["advice"] += "；办事处目录有变化，可跑 check_office_changes 查看"
+        except Exception as exc:  # noqa: BLE001
+            result["office_changes"] = {"error": str(exc)[:120]}
     except Exception as exc:
         result["db_error"] = str(exc)
         if not result["tunnels"]:
