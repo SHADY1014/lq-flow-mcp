@@ -78,6 +78,33 @@ python3 setup.py --check
 
 ---
 
+
+## 内部懒人包（给同事用，零配置）
+
+上面的 1–4 步适合开发者。给同事分发时用懒人包，对方不用填任何东西：
+
+**发放人**（你自己的机器，需已配好 `~/.lq-flow.env`）：
+
+```bash
+python3 build_package.py
+# 产物：~/Desktop/lq-flow-懒人包.zip
+```
+
+包内含代码、`reports_catalog.json`、预填好的数据库连接、一键安装脚本。
+⚠️ 这个 zip **带数据库密码**，只走内部渠道（企业微信/共享盘），不要传 GitHub。
+
+**使用者**：
+
+1. 连公司 VPN
+2. Windows 双击 `install.bat`；macOS 双击 `install.command`
+3. 重启客户端，对 agent 说「跑一下 preflight」
+
+安装脚本会自动：装依赖 → 把配置复制到用户目录（600）→ 检测并注册到
+ZCode / Claude Desktop / Cursor → 做一次 1433 连通性检查。
+
+如果对方**没装经销商系统客户端**也没关系：懒人包不依赖客户端，账号已在包里；
+想换账号则删掉 `~/.lq-flow.env` 后运行 `python3 setup.py`（支持从客户端 ini 自动提取）。
+
 ## 工具清单
 
 | 工具 | 用途 |
