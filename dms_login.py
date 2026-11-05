@@ -167,9 +167,26 @@ def main() -> int:
             proc.terminate()
         return 5
 
+    # 顺带记录登录用户 ID（报表权限过滤需要）
+    user_id = ""
+    try:
+        ws2 = websocket.create_connection(page["webSocketDebuggerUrl"], timeout=5)
+        ws2.send(json.dumps({"id": 21, "method": "Runtime.evaluate",
+                             "params": {"expression": "localStorage.getItem('sid')||''", "returnByValue": True}}))
+        for _ in range(10):
+            msg = json.loads(ws2.recv())
+            if msg.get("id") == 21:
+                sid = str((msg.get("result", {}).get("result", {}) or {}).get("value") or "")
+                if sid:
+                    user_id = sid.split("-")[-1][-8:]
+                break
+        ws2.close()
+    except Exception:
+        pass
+
     out = Path(args.out).expanduser()
     out.write_text(json.dumps({"saved_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                               "host": HOST_HINT, "cookies": picked},
+                               "host": HOST_HINT, "user_id": user_id, "cookies": picked},
                               ensure_ascii=False, indent=1), encoding="utf-8")
     os.chmod(out, 0o600)
     print(f"✓ 已保存 {len(picked)} 条 Cookie → {out}")

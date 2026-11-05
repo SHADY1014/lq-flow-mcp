@@ -143,6 +143,19 @@ MCP 侧对应工具：
 |---|---|
 | `dms_status()` | 会话是否有效 |
 | `dms_fetch(path, params, save_to?)` | 带 Cookie 请求网页接口（如 `servlet/DataSetQueryServlet`） |
+| `dms_flow_report(year, month, day?, dept_code?, out_dir?, file_name?)` | 导出网页版「二级货物流向明细表」（BIRT，按月/日、按办事处） |
+
+网页版流向报表链路（已验证）：
+
+```
+POST /hjerp/servlet/LoadReportServlet?reportFile=d_sale/d_report_sale_2dcinvout_detail.rptdesign
+  → 返回 BIRT 元数据（:9095/hjreport/frameset）
+GET  http://192.168.199.26:9095/hjreport/frameset?__report=...&__format=xls&reportArg=<SQL>
+  → Excel 2003 XML
+```
+
+`reportArg` 是**明文 SQL**（不是 base64），页面里的 `<br/>` 要换成换行符；
+`__format=xls` 才是导出，`spreadsheet` 会回落成 HTML。
 
 ## 工具清单
 

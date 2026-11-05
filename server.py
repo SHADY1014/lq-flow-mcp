@@ -945,6 +945,118 @@ def dms_fetch(path: str, params: str = "", save_to: str = "", limit: int = 20000
     return result
 
 
+
+DMS_REPORT_BASE = os.getenv("LQ_DMS_REPORT_BASE", "http://192.168.199.26:9095/hjreport")
+DMS_FLOW_RPT = "d_sale/d_report_sale_2dcinvout_detail.rptdesign"
+
+
+def _dms_meta() -> tuple[str, str]:
+    data = json.loads(DMS_COOKIE.read_text(encoding="utf-8")) if DMS_COOKIE.exists() else {}
+    return data.get("user_id", ""), _dms_cookie_header() or ""
+
+
+@mcp.tool()
+def dms_flow_report(year: int, month: int, day: int | None = None,
+                    dept_code: str | None = None, dept_name: str | None = None,
+                    out_dir: str | None = None, file_name: str | None = None,
+                    keep_raw: bool = True) -> dict:
+    """导出 DMS 网页版「二级货物流向明细表」（BIRT 报表，按月/日、可按办事处）。
+
+    需要先 python3 dms_login.py 建立会话。day 为空则导出整月。
+    """
+    import base64
+    import calendar
+    import urllib.parse
+    import urllib.request
+    import xml.etree.ElementTree as ET
+
+    uid, cookie = _dms_meta()
+    if not cookie:
+        return {"ok": False, "error": "没有 DMS 会话，先运行 python3 dms_login.py"}
+
+    if not dept_code and dept_name:
+        for comp, dq, o in _iter_offices():
+            if _norm(o["名称"]) == _norm(dept_name):
+                dept_code = str(o.get("ERP代码") or "").strip()
+                break
+
+    start = dt.date(year, month, day or 1)
+    end = dt.date(year, month, day) if day else dt.date(year, month, calendar.monthrange(year, month)[1])
+    cond = f"a.date_out >= '{start}' and a.date_out <= '{end}'"
+    perm = (f"(g.id_dept in(select id_dept from ctlm1221 where id_user = '{uid}' "
+            f"and id_user in(select id_user from ctlm1203 where id_post in (select id_post from ctlm1004 where flag_post = 'I' ))) "
+            f"<br/>or<br/>a.id_corr in (select id_corr from ctlm1127 where id_user = '{uid}' "
+            f"and id_user in(select id_user from ctlm1203 where id_post in (select id_post from ctlm1004 where flag_post = 'O' ))))")
+    sql = f"{cond} and {perm}"
+    if dept_code:
+        sql += f" and g.id_dept = '{dept_code}'"
+    sql = sql.replace("<br/>", "\n")  # 页面里的换行标记，SQL 里不能出现
+
+    qs = urllib.parse.urlencode({
+        "__report": DMS_FLOW_RPT, "__format": "xls",
+        "reportArg": sql, "userid": uid,
+    })
+    url = f"{DMS_REPORT_BASE}/frameset?{qs}"
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"Cookie": cookie}), timeout=300) as r:
+            raw = r.read()
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)[:200]}
+
+    NS = "{urn:schemas-microsoft-com:office:spreadsheet}"
+    try:
+        root = ET.fromstring(raw)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"返回不是 Excel XML：{exc}"[:200], "bytes": len(raw)}
+
+    rows = []
+    for r in root.findall(f".//{NS}Row"):
+        vals = []
+        for c in r.findall(f"{NS}Cell"):
+            idx = c.get(f"{NS}Index")
+            if idx:
+                vals.extend([""] * (int(idx) - 1 - len(vals)))
+            d = c.find(f"{NS}Data")
+            vals.append(d.text if d is not None and d.text is not None else "")
+        rows.append(vals)
+    if not rows:
+        return {"ok": False, "error": "报表为空"}
+
+    import openpyxl
+    from openpyxl.styles import Font, Alignment, PatternFill
+    name = file_name or (f"货物流向_{(dept_code or '全部')}_{start:%Y%m%d}"
+                         + ("" if day else f"-{end:%Y%m%d}") + "_网页版.xlsx")
+    path = Path(out_dir or DEFAULT_OUT) / name
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "货物流向"
+    fill = PatternFill("solid", fgColor="DDEBF7")
+    for ri, row in enumerate(rows, start=1):
+        ws.append(row)
+        if ri == 2:
+            for ci in range(1, len(row) + 1):
+                c = ws.cell(ri, ci)
+                c.font = Font(bold=True)
+                c.fill = fill
+                c.alignment = Alignment(horizontal="center")
+    ws.freeze_panes = "A3"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(path)
+
+    if keep_raw:
+        raw_path = path.with_suffix(".raw.xls")
+        raw_path.write_bytes(raw)
+    total = None
+    for v in rows[-1]:
+        try:
+            total = float(v); break
+        except (TypeError, ValueError):
+            continue
+    return {"ok": True, "path": str(path), "rows": max(0, len(rows) - 3),
+            "dept": dept_code or "全部", "date_from": str(start), "date_to": str(end),
+            "total": total}
+
+
 @mcp.tool()
 def run_report_proc(proc: str, param: str = " 3=3 ",
                     limit: int = 200, offset: int = 0) -> dict:
