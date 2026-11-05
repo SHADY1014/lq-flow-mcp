@@ -79,6 +79,23 @@ python3 setup.py --check
 ---
 
 
+
+## 从 GitHub 直接安装
+
+仓库**不含**账号密码，所以从 GitHub 装时会自动进入配置向导：
+
+```bash
+git clone https://github.com/SHADY1014/lq-flow-mcp.git ~/lq-flow-mcp
+cd ~/lq-flow-mcp
+python3 install.py
+```
+
+`install.py` 检测不到预置配置时，会自动调用 `setup.py`：先检查 VPN →
+扫描本机和佳客户端 ini 自动取账号 → 找不到就提示手工输入数据库账号。
+配置成功后继续自动注册客户端并做连通性检查。
+
+如果只想手工控制每一步，跳过 `install.py`，按上面「1. 安装依赖 → 4. 验证」走即可。
+
 ## 内部懒人包（给同事用，零配置）
 
 上面的 1–4 步适合开发者。给同事分发时用懒人包，对方不用填任何东西：

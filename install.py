@@ -50,10 +50,12 @@ def ensure_env() -> bool:
     if ENV_DST.exists():
         line(f"  · 已存在 {ENV_DST}，保留现有配置")
         return True
+
     if not ENV_SRC.exists():
-        line("  ✗ 包内缺少 .lq-flow.env，无法自动配置")
-        line("    请运行 python3 setup.py 手工配置，或向发放人索取完整懒人包")
-        return False
+        line("  · 未发现预置配置（GitHub 安装模式），进入配置向导")
+        line("    会先检查 VPN，再识别客户端账号或提示输入数据库账号\n")
+        rc = subprocess.call([sys.executable, str(HERE / "setup.py")])
+        return rc == 0 and ENV_DST.exists()
     text = ENV_SRC.read_text(encoding="utf-8")
     out_dir = Path.home() / "Desktop" / "货物流向导出"
     text = "\n".join(
