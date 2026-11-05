@@ -88,6 +88,32 @@ python3 setup.py --check
 | `run_report_proc(proc, param)` | 执行报表存储过程 |
 | `query_readonly(sql)` | 只读 SQL |
 | `export_query(sql, out_path)` | 任意查询结果导出 Excel |
+| `report_catalog(keyword?, kind?, only_exportable?)` | **经销商系统全部报表目录**（按系统菜单，不预设业务口径） |
+| `report_detail(name_or_id)` | 单个报表的登记信息 + 数据源字段 |
+| `export_catalog_table(table_id, where?, out_path)` | 按目录导出某张报表数据表（受白名单约束） |
+
+### 报表目录
+
+目录由 ERP 自己的菜单表（`hjappmenu`）生成，`reports_catalog.json` 里共 **657 条**：
+
+| 类型 | 数量 | 含义 |
+|---|---|---|
+| `table` | 479 | 有对应数据表/视图，可用 `export_catalog_table` 直接导 |
+| `proc` | 4 | 有对应存储过程，用 `run_report_proc` |
+| `datawindow` | 174 | SQL 编译在客户端里，数据库无对象，只能界面导出或复刻 |
+
+每条还带 `匹配方式`：`精确`（表名完全一致）、`后缀`、`包含`、`人工`。**模糊匹配的条目导出前建议先 `report_detail` 核一次字段**。
+
+用法：
+
+```
+report_catalog("O2O")                       # 按系统菜单名搜索
+report_catalog(kind="table", only_exportable=True)
+report_detail("O2O电商平台订单日报表")        # 看数据源和字段
+export_catalog_table("d_app_cinvout_zone_01_new2",
+                     where="fiscal_year=2026 and fiscal_period=10",
+                     out_path="/path/导出.xlsx")
+```
 
 ### 常用示例
 

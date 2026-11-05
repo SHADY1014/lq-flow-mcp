@@ -688,6 +688,82 @@ def export_status(job_id: str) -> dict:
     return {"ok": True, "job_id": job_id, **job}
 
 
+
+# ---------------- 报表目录（全量登记）
+CATALOG_FILE = Path(__file__).resolve().parent / "reports_catalog.json"
+
+
+def _load_catalog():
+    if CATALOG_FILE.exists():
+        return json.loads(CATALOG_FILE.read_text(encoding="utf-8"))
+    return []
+
+
+@mcp.tool()
+def report_catalog(keyword: str | None = None, kind: str | None = None,
+                   only_exportable: bool = False, limit: int = 100) -> dict:
+    """经销商系统全部报表菜单目录。kind: table/proc/datawindow。"""
+    items = _load_catalog()
+    kw = (keyword or "").strip()
+    if kw:
+        items = [x for x in items if kw in x.get("报表名称", "") or kw in x.get("table_id", "")]
+    if kind:
+        items = [x for x in items if x.get("类型") == kind]
+    if only_exportable:
+        items = [x for x in items if x.get("类型") in ("table", "proc")]
+    return {"count": len(items), "reports": items[:max(1, min(limit, 700))]}
+
+
+@mcp.tool()
+def report_detail(name_or_id: str) -> dict:
+    """查单个报表的登记信息 + 数据源字段（可导时）。"""
+    key = (name_or_id or "").strip()
+    hit = [x for x in _load_catalog()
+           if key and (key in x.get("报表名称", "") or key == x.get("table_id"))]
+    if not hit:
+        return {"ok": False, "error": f"未找到报表：{key}"}
+    item = hit[0]
+    out = {"ok": True, **item}
+    src = item.get("数据源")
+    if item.get("类型") == "table" and src:
+        conn = _connect(timeout=300)
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "select c.name from lqcerp_lnk.lqcerp.sys.columns c "
+                "join lqcerp_lnk.lqcerp.sys.objects o on c.object_id=o.object_id "
+                "where o.name=%s order by c.column_id", (src,))
+            out["columns"] = [r[0] for r in cur.fetchall()]
+        finally:
+            conn.close()
+    return out
+
+
+@mcp.tool()
+def export_catalog_table(table_id: str, where: str = "", out_path: str = "",
+                         sheet: str = "数据", total_row: bool = False,
+                         limit: int = 200000) -> dict:
+    """导出报表目录里登记的表。where 为可选 SQL 条件（只允许比较/IN/LIKE）。"""
+    cat = {x["table_id"]: x for x in _load_catalog()}
+    item = cat.get((table_id or "").strip())
+    if not item or item.get("类型") != "table":
+        return {"ok": False, "error": "该 table_id 不在目录中或不是表类型，先用 report_catalog 查"}
+    src = item["数据源"]
+    cond = (where or "").strip()
+    for bad in (";", "--", "/*", "insert", "update", "delete", "drop", "alter", "exec"):
+        if bad in cond.lower():
+            return {"ok": False, "error": f"where 含不允许内容: {bad}"}
+    sql = f"select * from lqcerp_lnk.lqcerp.dbo.[{src}] with(nolock)"
+    if cond:
+        sql += " where " + cond
+    cols, rows, trunc = _query_readonly(sql, limit)
+    if not out_path:
+        return {"ok": False, "error": "out_path 必填", "columns": cols, "rows": len(rows)}
+    path = _write_xlsx(Path(out_path).expanduser(), cols, rows, sheet, total_row)
+    return {"ok": True, "path": str(path), "rows": len(rows), "truncated": trunc,
+            "source": src, "match": item.get("匹配方式")}
+
+
 @mcp.tool()
 def run_report_proc(proc: str, param: str = " 3=3 ",
                     limit: int = 200, offset: int = 0) -> dict:
