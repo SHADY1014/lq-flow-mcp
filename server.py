@@ -691,12 +691,19 @@ def export_status(job_id: str) -> dict:
 
 # ---------------- 报表目录（全量登记）
 CATALOG_FILE = Path(__file__).resolve().parent / "reports_catalog.json"
+WEB_CATALOG_FILE = Path(__file__).resolve().parent / "dms_web_catalog.json"
 
 
 def _load_catalog():
+    """合并两个来源：ERP 数据库目录 + DMS 网页版目录。"""
+    items = []
     if CATALOG_FILE.exists():
-        return json.loads(CATALOG_FILE.read_text(encoding="utf-8"))
-    return []
+        for x in json.loads(CATALOG_FILE.read_text(encoding="utf-8")):
+            x.setdefault("来源", "ERP数据库")
+            items.append(x)
+    if WEB_CATALOG_FILE.exists():
+        items.extend(json.loads(WEB_CATALOG_FILE.read_text(encoding="utf-8")))
+    return items
 
 
 @mcp.tool()

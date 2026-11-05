@@ -147,6 +147,17 @@ ZCode / Claude Desktop / Cursor → 做一次 1433 连通性检查。
 | `check_office_changes(months?)` | 对比近 N 个月实际出库办事处与 regions.json，列出新增/消失/改名 |
 | `refresh_regions(apply?, months?)` | 把新增办事处补进 regions.json（默认 dry-run） |
 
+
+### DMS 网页版目录
+
+`dms_web_catalog.json` 登记了 DMS 网页版（`http://192.168.199.26:9090/hjerp`）的 **99 个菜单**，
+类型标为 `web`（分组标 `group`），`report_catalog` 会与数据库目录合并返回，
+用 `来源` 字段区分（`ERP数据库` / `DMS网页版`）。
+
+注意：网页版登录需要**图形验证码**，密码在前端 RSA 加密，MCP 无法无人值守登录；
+这些条目只用于"知道有这张表、去哪导"，不能通过 `export_catalog_table` 导出。
+如需接口级导出，需要提供已登录会话（Cookie）后再做对接。
+
 ### 报表目录
 
 目录由 ERP 自己的菜单表（`hjappmenu`）生成，`reports_catalog.json` 里共 **657 条**：
