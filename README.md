@@ -328,6 +328,25 @@ ERP 的 `invalid_flag` 不可靠（大量作废代码仍为 0），所以不用�
 权限上不需要额外申请：这个账号本身就有 `lqerp` 的 SELECT、临时表、`EXEC`，
 以及链接服务器 `lqcerp_lnk` 的访问权限。
 
+
+### 导出防误导规则（重要）
+
+报表目录里有相当一部分底表是**推断**出来的（`匹配方式` = 后缀/包含），且存在
+**同一张底表被多个报表共用**的情况。为了避免"导错表"，`export_catalog_table` 设了四道闸：
+
+| 规则 | 行为 |
+|---|---|
+| 同一 table_id/数据源 对应多个报表名 | **直接拒绝**，返回候选列表，必须人工指定 |
+| `expect_name` 与目录登记名不符 | **直接拒绝**（`expect_name` 为必填） |
+| 匹配方式为「包含」（猜出来的底表） | 默认拒绝，确需导出要显式 `allow_fuzzy=True` |
+| 每次导出返回 `preview`（前 3 行）+ 报表名 + 数据源 | 便于当场核对是否导错 |
+
+另外 `report_catalog` 命中多条时返回 `ambiguous: true` 并提示"禁止自行挑选"。
+`only_exportable=True` 会自动排除低可信度条目。
+
+**调用约定**：先 `report_catalog` 拿到确切 `table_id` 和中文名，再把两者一起传给
+`export_catalog_table`，不要凭关键字猜表。
+
 ## 常见问题
 
 **Q: preflight 显示 db_reachable=false**

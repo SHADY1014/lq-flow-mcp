@@ -831,25 +831,43 @@ def refresh_catalog(sources: str = "all") -> dict:
     return result
 
 
+def _confidence(item: dict) -> str:
+    how = item.get("匹配方式") or ""
+    if how in ("精确", "人工"):
+        return "高"
+    if how == "后缀":
+        return "中"
+    return "低"
+
+
 @mcp.tool()
 def report_catalog(keyword: str | None = None, kind: str | None = None,
                    only_exportable: bool = False, limit: int = 100) -> dict:
-    """经销商系统报表目录（首次使用需先 refresh_catalog）。kind: table/proc/datawindow/web。"""
+    """经销商系统报表目录（首次使用需先 refresh_catalog）。
+
+    返回 ambiguous=True 时表示关键字命中多条，必须挑一条，不要自己猜。
+    """
     items = _load_catalog()
     if not items:
         return {"count": 0, "need_refresh": True,
-                "hint": "目录为空：先运行 refresh_catalog()（需要数据库账号；抓网页版还需 dms_login.py）"}
+                "hint": "目录为空：先运行 refresh_catalog()"}
     kw = (keyword or "").strip()
     if kw:
         items = [x for x in items
-                 if kw in x.get("报表名称", "") or kw in x.get("table_id", "")
+                 if kw in (x.get("报表名称") or "") or kw == (x.get("table_id") or "")
                  or kw in (x.get("上级") or "")]
     if kind:
         items = [x for x in items if x.get("类型") == kind]
     if only_exportable:
-        items = [x for x in items if x.get("类型") in ("table", "proc")]
-    return {"count": len(items), "updated_at": _catalog_raw().get("updated_at"),
-            "reports": items[:max(1, min(limit, 800))]}
+        items = [x for x in items if x.get("类型") in ("table", "proc") and _confidence(x) != "低"]
+    for x in items:
+        if x.get("类型") in ("table", "proc"):
+            x["可信度"] = _confidence(x)
+    hit = items[:max(1, min(limit, 800))]
+    return {"count": len(items), "ambiguous": len(items) > 1,
+            "updated_at": _catalog_raw().get("updated_at"),
+            "hint": ("命中多条，请指定具体 table_id，禁止自行挑选" if len(items) > 1 else ""),
+            "reports": hit}
 
 
 @mcp.tool()
@@ -857,11 +875,11 @@ def report_detail(name_or_id: str) -> dict:
     """查单个报表的登记信息 + 数据源字段（可导时）。"""
     key = (name_or_id or "").strip()
     hit = [x for x in _load_catalog()
-           if key and (key in x.get("报表名称", "") or key == x.get("table_id"))]
+           if key and (key == (x.get("table_id") or "") or key == (x.get("报表名称") or ""))]
     if not hit:
         return {"ok": False, "error": f"未找到报表：{key}（目录可能未刷新，先跑 refresh_catalog）"}
     item = hit[0]
-    out = {"ok": True, **item}
+    out = {"ok": True, **item, "可信度": _confidence(item)}
     src = item.get("数据源")
     if item.get("类型") == "table" and src:
         conn = _connect(timeout=300)
@@ -878,514 +896,67 @@ def report_detail(name_or_id: str) -> dict:
 
 
 @mcp.tool()
-def export_catalog_table(table_id: str, where: str = "", out_path: str = "",
-                         sheet: str = "数据", total_row: bool = False,
-                         limit: int = 200000) -> dict:
-    """导出报表目录里登记的表。where 为可选 SQL 条件（只允许比较/IN/LIKE）。"""
-    cat = {x["table_id"]: x for x in _load_catalog() if x.get("table_id")}
-    item = cat.get((table_id or "").strip())
-    if not item or item.get("类型") != "table":
-        return {"ok": False, "error": "该 table_id 不在目录中或不是表类型，先用 report_catalog 查"}
+def export_catalog_table(table_id: str, expect_name: str, where: str = "",
+                         out_path: str = "", sheet: str = "数据",
+                         total_row: bool = False, limit: int = 200000,
+                         preview_only: bool = False,
+                         allow_fuzzy: bool = False) -> dict:
+    """按目录导出某张报表底表。**必须提供 expect_name（报表中文名）做一致性校验**。
+
+    防误导规则：
+    - 同一 table_id 对应多个报表名 → 拒绝，先指定清楚；
+    - expect_name 与目录登记名不匹配 → 拒绝；
+    - 匹配方式为"包含"（猜出来的底表）默认拒绝，确需导出要 allow_fuzzy=True；
+    - preview_only=True 只返回前 3 行，不写文件。
+    """
+    tid = (table_id or "").strip()
+    cands = [x for x in _load_catalog()
+             if (x.get("table_id") or "").strip() == tid
+             or (x.get("数据源") or "").strip() == tid]
+    if not cands:
+        return {"ok": False, "error": f"table_id 不在目录中：{tid}"}
+    names = sorted({(x.get("报表名称") or "").strip() for x in cands})
+    if len(names) > 1:
+        return {"ok": False, "error": "该 table_id 对应多个报表，先指定具体报表名",
+                "candidates": names}
+    item = cands[0]
+    if item.get("类型") != "table":
+        return {"ok": False, "error": f"该条目类型为 {item.get('类型')}，不是可导出表"}
+    conf = _confidence(item)
+    if conf == "低" and not allow_fuzzy:
+        return {"ok": False,
+                "error": f"底表是模糊匹配（{item.get('匹配方式')}），默认不导；确认无误可传 allow_fuzzy=True",
+                "贴出的报表名": item.get("报表名称"), "数据源": item.get("数据源")}
+    want = (expect_name or "").strip()
+    if not want:
+        return {"ok": False, "error": "必须提供 expect_name（报表中文名）用于校验"}
+    if want not in (item.get("报表名称") or ""):
+        return {"ok": False, "error": "expect_name 与目录登记不符",
+                "expect_name": want, "目录登记": item.get("报表名称")}
+
     src = item["数据源"]
     cond = (where or "").strip()
     for bad in (";", "--", "/*", "insert", "update", "delete", "drop", "alter", "exec"):
         if bad in cond.lower():
             return {"ok": False, "error": f"where 含不允许内容: {bad}"}
-    sql = f"select * from lqcerp_lnk.lqcerp.dbo.[{src}] with(nolock)"
+    base = f"select * from lqcerp_lnk.lqcerp.dbo.[{src}] with(nolock)"
     if cond:
-        sql += " where " + cond
-    cols, rows, trunc = _query_readonly(sql, limit)
+        base += " where " + cond
+
+    cols, rows, _ = _query_readonly(base, 3)
+    preview = [[_jsonable(v) for v in r] for r in rows]
+
+    if preview_only:
+        return {"ok": True, "preview_only": True, "报表名称": item.get("报表名称"),
+                "数据源": src, "可信度": conf, "columns": cols, "rows": preview}
+
+    cols, rows, trunc = _query_readonly(base, limit)
     if not out_path:
-        return {"ok": False, "error": "out_path 必填", "columns": cols, "rows": len(rows)}
+        return {"ok": False, "error": "out_path 必填", "rows": len(rows)}
     path = _write_xlsx(Path(out_path).expanduser(), cols, rows, sheet, total_row)
     return {"ok": True, "path": str(path), "rows": len(rows), "truncated": trunc,
-            "source": src, "match": item.get("匹配方式")}
-
-
-# ---------------------------------------------------------------- 办事处变更检测/同步
-def _erp_active_offices(months: int = 3) -> dict[str, str]:
-    """近 N 个月出库数据里实际出现的办事处 -> 名称（名称取 ctlm1003）。"""
-    conn = _connect(timeout=600)
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            """select distinct rtrim(zone_id) as code
-               from cinvout_02 with(nolock)
-               where sts_flag='S'
-                 and out_time >= dateadd(month, -%s, getdate())
-                 and rtrim(isnull(zone_id,'')) <> ''""", (int(months),))
-        codes = [r[0] for r in cur.fetchall()]
-        cur.execute("""select rtrim(dept_id), rtrim(dept_name), rtrim(isnull(sdept_id,''))
-                       from ctlm1003 with(nolock) where len(rtrim(dept_id))=6""")
-        info = {r[0]: {"name": r[1], "parent": r[2]} for r in cur.fetchall()}
-        return {c: info.get(c, {}).get("name", "") for c in codes}
-    finally:
-        conn.close()
-
-
-_VOID_PAT = re.compile(r"作废|失效|停用|虚拟|测试|已删除")
-
-
-def _is_void(name: str) -> bool:
-    return bool(_VOID_PAT.search(name or ""))
-
-
-def _json_offices() -> dict[str, dict]:
-    out = {}
-    for comp, dq, o in _iter_offices():
-        code = str(o.get("ERP代码") or "").strip()
-        if code:
-            out[code] = {"名称": o["名称"], "分公司": comp, "大区": dq}
-    return out
-
-
-@mcp.tool()
-def check_office_changes(months: int = 3) -> dict:
-    """对比「近 N 个月实际出库的办事处」与 regions.json，列出新增/消失/改名。
-
-    办事处代码调整后先跑这个；需要写入用 refresh_regions(apply=True)。
-    """
-    erp = _erp_active_offices(months)
-    js = _json_offices()
-    raw_new = sorted(set(erp) - set(js))
-    new = [c for c in raw_new if not _is_void(erp.get(c, ""))]
-    ignored = [c for c in raw_new if _is_void(erp.get(c, ""))]
-    gone = sorted(set(js) - set(erp))
-    renamed = [
-        {"代码": c, "原名称": js[c]["名称"], "ERP名称": erp[c]}
-        for c in sorted(set(erp) & set(js))
-        if erp[c] and _norm(erp[c]) != _norm(js[c]["名称"])
-    ]
-    return {
-        "对比月份数": months,
-        "ERP出库办事处数": len(erp),
-        "regions.json办事处数": len(js),
-        "新增": [{"代码": c, "名称": erp[c]} for c in new],
-        "忽略的作废代码数": len(ignored),
-        "消失": [{"代码": c, "名称": js[c]["名称"], "分公司": js[c]["分公司"], "大区": js[c]["大区"]} for c in gone],
-        "改名": renamed,
-        "结论": "无变化" if not (new or gone or renamed) else "有变化，确认后执行 refresh_regions(apply=True)",
-    }
-
-
-@mcp.tool()
-def refresh_regions(apply: bool = False, months: int = 3) -> dict:
-    """把新增办事处补进 regions.json。
-
-    apply=False 只返回将写入的内容；apply=True 才落盘（新增项分公司/大区标为「待确认」，
-    需人工补大区归属后再用于 region 过滤）。
-    """
-    erp = _erp_active_offices(months)
-    js = _json_offices()
-    new = [c for c in sorted(set(erp) - set(js)) if not _is_void(erp.get(c, ""))]
-    if not new:
-        return {"ok": True, "changed": 0, "message": "没有新增办事处，无需写入"}
-    plan = [{"代码": c, "名称": erp[c], "分公司": "待确认", "大区": "待确认"} for c in new]
-    if not apply:
-        return {"ok": True, "changed": 0, "dry_run": True, "will_add": plan}
-    path = REGIONS_FILE
-    data = json.loads(path.read_text(encoding="utf-8"))
-    bucket = data.setdefault("分公司", {}).setdefault("待确认", {}).setdefault("大区", {}).setdefault("待确认", [])
-    existing = {str(x.get("ERP代码")) for x in bucket}
-    for item in plan:
-        if item["代码"] not in existing:
-            bucket.append({"名称": item["名称"], "OA部门编码": "", "ERP代码": item["代码"]})
-    data["更新时间"] = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    data["说明"] = (data.get("说明") or "") + "；新增办事处自动补充，分公司/大区待人工确认"
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
-    return {"ok": True, "changed": len(plan), "added": plan, "file": str(path)}
-
-
-
-# ---------------------------------------------------------------- DMS 网页版（Cookie 会话）
-DMS_BASE = os.getenv("LQ_DMS_BASE", "http://192.168.199.26:9090/hjerp")
-DMS_COOKIE = Path.home() / ".lq-dms.cookie"
-
-
-def _dms_cookie_header() -> str | None:
-    if not DMS_COOKIE.exists():
-        return None
-    try:
-        data = json.loads(DMS_COOKIE.read_text(encoding="utf-8"))
-        cookies = data.get("cookies") or []
-        return "; ".join(f"{c['name']}={c['value']}" for c in cookies) or None
-    except Exception:
-        return None
-
-
-@mcp.tool()
-def dms_status() -> dict:
-    """检查 DMS 网页版登录会话是否有效（Cookie 由 dms_login.py 手动登录生成）。"""
-    import urllib.request
-
-    if not DMS_COOKIE.exists():
-        return {"logged_in": False,
-                "advice": "未找到会话：运行 python3 dms_login.py，在弹出的浏览器里登录一次"}
-    header = _dms_cookie_header()
-    try:
-        req = urllib.request.Request(f"{DMS_BASE}/indexServlet", headers={"Cookie": header or ""})
-        with urllib.request.urlopen(req, timeout=8) as r:
-            ok = r.status == 200 and len(r.read(200)) > 0
-        saved = json.loads(DMS_COOKIE.read_text(encoding="utf-8")).get("saved_at")
-        return {"logged_in": ok, "base": DMS_BASE, "saved_at": saved,
-                "advice": "会话有效" if ok else "会话已失效，重新运行 python3 dms_login.py"}
-    except Exception as exc:  # noqa: BLE001
-        return {"logged_in": False, "base": DMS_BASE, "error": str(exc)[:150],
-                "advice": "会话失效或网络不通；重新运行 dms_login.py"}
-
-
-@mcp.tool()
-def dms_fetch(path: str, params: str = "", save_to: str = "", limit: int = 200000) -> dict:
-    """带登录 Cookie 请求 DMS 网页接口。
-
-    path 例如 "servlet/DataSetQueryServlet"；params 为查询串（a=1&b=2）。
-    返回文本/JSON；若响应是二进制（如 xlsx），需给 save_to 保存到文件。
-    """
-    import urllib.parse
-    import urllib.request
-
-    header = _dms_cookie_header()
-    if not header:
-        return {"ok": False, "error": "没有会话 Cookie，先运行 python3 dms_login.py"}
-    url = f"{DMS_BASE}/{path.lstrip('/')}"
-    if params:
-        url += ("&" if "?" in url else "?") + params.lstrip("?")
-    req = urllib.request.Request(url, headers={"Cookie": header})
-    try:
-        with urllib.request.urlopen(req, timeout=60) as r:
-            ctype = r.headers.get("Content-Type", "")
-            raw = r.read(limit)
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "error": str(exc)[:200], "url": url}
-
-    if any(k in ctype.lower() for k in ("excel", "spreadsheet", "octet-stream")) or path.lower().endswith("export"):
-        if not save_to:
-            return {"ok": False, "error": "响应是二进制，请提供 save_to", "content_type": ctype}
-        out = Path(save_to).expanduser()
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_bytes(raw)
-        return {"ok": True, "saved": str(out), "bytes": len(raw), "content_type": ctype}
-
-    text = raw.decode("utf-8", "replace")
-    result = {"ok": True, "content_type": ctype, "bytes": len(raw), "url": url}
-    try:
-        result["json"] = json.loads(text)
-    except Exception:
-        result["text"] = text[:4000]
-    return result
-
-
-
-DMS_REPORT_BASE = os.getenv("LQ_DMS_REPORT_BASE", "http://192.168.199.26:9095/hjreport")
-DMS_FLOW_RPT = "d_sale/d_report_sale_2dcinvout_detail.rptdesign"
-
-
-def _dms_meta() -> tuple[str, str]:
-    data = json.loads(DMS_COOKIE.read_text(encoding="utf-8")) if DMS_COOKIE.exists() else {}
-    return data.get("user_id", ""), _dms_cookie_header() or ""
-
-
-@mcp.tool()
-def dms_flow_report(year: int, month: int, day: int | None = None,
-                    dept_code: str | None = None, dept_name: str | None = None,
-                    out_dir: str | None = None, file_name: str | None = None,
-                    keep_raw: bool = True) -> dict:
-    """导出 DMS 网页版「二级货物流向明细表」（BIRT 报表，按月/日、可按办事处）。
-
-    需要先 python3 dms_login.py 建立会话。day 为空则导出整月。
-    """
-    import base64
-    import calendar
-    import urllib.parse
-    import urllib.request
-    import xml.etree.ElementTree as ET
-
-    uid, cookie = _dms_meta()
-    if not cookie:
-        return {"ok": False, "error": "没有 DMS 会话，先运行 python3 dms_login.py"}
-
-    if not dept_code and dept_name:
-        for comp, dq, o in _iter_offices():
-            if _norm(o["名称"]) == _norm(dept_name):
-                dept_code = str(o.get("ERP代码") or "").strip()
-                break
-
-    start = dt.date(year, month, day or 1)
-    end = dt.date(year, month, day) if day else dt.date(year, month, calendar.monthrange(year, month)[1])
-    cond = f"a.date_out >= '{start}' and a.date_out <= '{end}'"
-    perm = (f"(g.id_dept in(select id_dept from ctlm1221 where id_user = '{uid}' "
-            f"and id_user in(select id_user from ctlm1203 where id_post in (select id_post from ctlm1004 where flag_post = 'I' ))) "
-            f"<br/>or<br/>a.id_corr in (select id_corr from ctlm1127 where id_user = '{uid}' "
-            f"and id_user in(select id_user from ctlm1203 where id_post in (select id_post from ctlm1004 where flag_post = 'O' ))))")
-    sql = f"{cond} and {perm}"
-    if dept_code:
-        sql += f" and g.id_dept = '{dept_code}'"
-    sql = sql.replace("<br/>", "\n")  # 页面里的换行标记，SQL 里不能出现
-
-    qs = urllib.parse.urlencode({
-        "__report": DMS_FLOW_RPT, "__format": "xls",
-        "reportArg": sql, "userid": uid,
-    })
-    url = f"{DMS_REPORT_BASE}/frameset?{qs}"
-    try:
-        with urllib.request.urlopen(urllib.request.Request(url, headers={"Cookie": cookie}), timeout=300) as r:
-            raw = r.read()
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "error": str(exc)[:200]}
-
-    NS = "{urn:schemas-microsoft-com:office:spreadsheet}"
-    try:
-        root = ET.fromstring(raw)
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "error": f"返回不是 Excel XML：{exc}"[:200], "bytes": len(raw)}
-
-    rows = []
-    for r in root.findall(f".//{NS}Row"):
-        vals = []
-        for c in r.findall(f"{NS}Cell"):
-            idx = c.get(f"{NS}Index")
-            if idx:
-                vals.extend([""] * (int(idx) - 1 - len(vals)))
-            d = c.find(f"{NS}Data")
-            vals.append(d.text if d is not None and d.text is not None else "")
-        rows.append(vals)
-    if not rows:
-        return {"ok": False, "error": "报表为空"}
-
-    import openpyxl
-    from openpyxl.styles import Font, Alignment, PatternFill
-    name = file_name or (f"货物流向_{(dept_code or '全部')}_{start:%Y%m%d}"
-                         + ("" if day else f"-{end:%Y%m%d}") + "_网页版.xlsx")
-    path = Path(out_dir or DEFAULT_OUT) / name
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "货物流向"
-    fill = PatternFill("solid", fgColor="DDEBF7")
-    for ri, row in enumerate(rows, start=1):
-        ws.append(row)
-        if ri == 2:
-            for ci in range(1, len(row) + 1):
-                c = ws.cell(ri, ci)
-                c.font = Font(bold=True)
-                c.fill = fill
-                c.alignment = Alignment(horizontal="center")
-    ws.freeze_panes = "A3"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    wb.save(path)
-
-    if keep_raw:
-        raw_path = path.with_suffix(".raw.xls")
-        raw_path.write_bytes(raw)
-    total = None
-    for v in rows[-1]:
-        try:
-            total = float(v); break
-        except (TypeError, ValueError):
-            continue
-    return {"ok": True, "path": str(path), "rows": max(0, len(rows) - 3),
-            "dept": dept_code or "全部", "date_from": str(start), "date_to": str(end),
-            "total": total}
-
-
-
-# ---------------------------------------------------------------- OA 协同办公
-OA_BASE = os.getenv("LQ_OA_BASE", "https://oa.lqp9.cn")
-OA_SESSION = Path.home() / ".lq-oa.cookie"
-
-
-def _oa_session() -> dict:
-    if not OA_SESSION.exists():
-        return {}
-    try:
-        return json.loads(OA_SESSION.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-def _oa_service(service: str, params: dict | None = None, timeout: int = 30) -> dict:
-    """调用 OA 的 /exoa/services（只认 HEADER 里的 token，不需要 Cookie）。"""
-    import urllib.parse
-    import urllib.request
-
-    data = _oa_session()
-    token = data.get("token", "")
-    if not token:
-        raise RuntimeError("没有 OA 会话，先运行 python3 oa_login.py")
-    qs = urllib.parse.urlencode({
-        "SERVICE": service,
-        "HEADER": json.dumps({"device_id": "PC", "token": token}, ensure_ascii=False),
-        "PARAMS": json.dumps(params or {}, ensure_ascii=False),
-    }, quote_via=urllib.parse.quote)
-    req = urllib.request.Request(f"{OA_BASE}/exoa/services?{qs}",
-                                 headers={"User-Agent": "Mozilla/5.0 (lq-flow-mcp)"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        text = r.read().decode("utf-8", "replace")
-    try:
-        return json.loads(text)
-    except Exception:
-        return {"_raw": text[:2000]}
-
-
-@mcp.tool()
-def oa_status() -> dict:
-    """检查 OA 会话是否有效（token 由 oa_login.py 手动登录生成）。"""
-    data = _oa_session()
-    if not data.get("token"):
-        return {"logged_in": False, "advice": "运行 python3 oa_login.py，在弹出的浏览器里登录一次"}
-    try:
-        res = _oa_service("OA.MenuService.getAllRooMenusOfUser")
-        menus = (res.get("RESULTS") or {}).get("list") or []
-        return {"logged_in": bool(menus), "user": data.get("user", ""),
-                "user_code": data.get("user_code", ""), "saved_at": data.get("saved_at"),
-                "top_menus": [m.get("name") for m in menus][:10],
-                "advice": "会话有效" if menus else "会话可能失效，重跑 oa_login.py"}
-    except Exception as exc:  # noqa: BLE001
-        return {"logged_in": False, "error": str(exc)[:150], "advice": "会话失效，重跑 oa_login.py"}
-
-
-@mcp.tool()
-def oa_menu(keyword: str | None = None, limit: int = 300) -> dict:
-    """OA 菜单树（扁平化）。keyword 按名称/编码过滤。"""
-    res = _oa_service("OA.MenuService.getAllRooMenusOfUser")
-    roots = (res.get("RESULTS") or {}).get("list") or []
-    items: list[dict] = []
-
-    def walk(node, parent=""):
-        for m in node or []:
-            name = (m.get("name") or "").strip()
-            items.append({"名称": name, "编码": (m.get("code") or "").strip(),
-                          "id": m.get("id"), "上级": parent,
-                          "地址": (m.get("viewUrl") or "").split("?")[0]})
-            walk(m.get("subMenus"), name)
-
-    walk(roots)
-    kw = (keyword or "").strip()
-    if kw:
-        items = [x for x in items if kw in x["名称"] or kw in x["编码"]]
-    return {"count": len(items), "menus": items[:max(1, min(limit, 500))]}
-
-
-@mcp.tool()
-def oa_services(service: str, params: str = "") -> dict:
-    """调用任意 OA 服务，如 "OA.UserAddressBookService.getUserByUserId"。
-
-    params 为 JSON 字符串（如 {"userId": "jiangkaihao"}）。
-    """
-    try:
-        p = json.loads(params) if params else {}
-    except Exception:
-        return {"ok": False, "error": "params 不是合法 JSON"}
-    try:
-        return {"ok": True, "service": service, "result": _oa_service(service, p)}
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "error": str(exc)[:200]}
-
-
-
-def _oa_post_json(path: str, payload: dict, timeout: int = 20) -> dict:
-    import urllib.request
-
-    data = _oa_session()
-    if not data.get("token"):
-        raise RuntimeError("没有 OA 会话，先运行 python3 oa_login.py")
-    cookie = "; ".join(f"{c['name']}={c['value']}" for c in data.get("cookies", []) if c.get("name"))
-    req = urllib.request.Request(
-        OA_BASE + path,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={"Content-Type": "application/json", "Cookie": cookie,
-                 "User-Agent": "Mozilla/5.0 (lq-flow-mcp)"},
-        method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        text = r.read().decode("utf-8", "replace")
-    try:
-        return json.loads(text)
-    except Exception:
-        return {"_raw": text[:500]}
-
-
-@mcp.tool()
-def oa_user(user_id: str) -> dict:
-    """按 OA 账号查用户（如 yangyinwen），返回姓名/部门。"""
-    try:
-        r = _oa_service("OA.UserAddressBookService.getUserByUserId", {"userId": user_id})
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "error": str(exc)[:150]}
-    u = r.get("RESULTS") or {}
-    if not u.get("USER_NAME"):
-        return {"ok": False, "error": f"未找到用户：{user_id}"}
-    return {"ok": True, "账号": user_id, "姓名": u.get("USER_NAME"),
-            "部门": u.get("DEPT_NAME"), "手机": u.get("USER_MOBI")}
-
-
-@mcp.tool()
-def oa_send_message(to_user_id: str, content: str) -> dict:
-    """给 OA 用户发即时消息（会真实发出，请谨慎）。
-
-    to_user_id 是 OA 账号（如 yangyinwen），不是姓名；可先用 oa_user 确认。
-    """
-    data = _oa_session()
-    if not data.get("token"):
-        return {"ok": False, "error": "没有 OA 会话，先运行 python3 oa_login.py"}
-    me = data.get("user_code") or ""
-    payload = {
-        "username": data.get("user", ""), "avatar": "", "id": me,
-        "type": "friend", "mine": True, "content": content,
-        "fromid": me, "toid": to_user_id,
-    }
-    try:
-        res = _oa_post_json("/api/LayIm/SendMessage", payload)
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "error": str(exc)[:200]}
-    return {"ok": res.get("code") == 0, "to": to_user_id, "content": content,
-            "response": res}
-
-
-
-@mcp.tool()
-def oa_flow_list(formset_id: int = 2036, status: int = 2, page_size: int = 10,
-                 page: int = 1) -> dict:
-    """查询 OA 流程实例（默认「自由流程(2026)」，status=2 为在办）。
-
-    返回：发起人、发起时间、当前步骤、当前处理人、单号。
-    """
-    import urllib.parse
-    import urllib.request
-
-    data = _oa_session()
-    if not data.get("token"):
-        return {"ok": False, "error": "没有 OA 会话，先运行 python3 oa_login.py"}
-    qs = urllib.parse.urlencode({
-        "SERVICE": "OA.MissiveService.queryMissive.V2",
-        "HEADER": json.dumps({"device_id": "PC", "token": data["token"]}, ensure_ascii=False),
-        "rnd": "0.1",
-        "type": "10",
-        "queryCondition": json.dumps({
-            "orderByColumn": 1, "orderDirection": 1,
-            "formsetIds": [str(formset_id)],
-            "formSetInstStatus": status,
-            "pageSize": max(1, min(int(page_size), 50)),
-            "pageNum": max(1, int(page)),
-        }, ensure_ascii=False),
-        "formSetInstStatus": str(status),
-    }, quote_via=urllib.parse.quote)
-    cookie = "; ".join(f"{c['name']}={c['value']}" for c in data.get("cookies", []) if c.get("name"))
-    try:
-        req = urllib.request.Request(f"{OA_BASE}/exoa/services?{qs}",
-                                     headers={"Cookie": cookie, "User-Agent": "Mozilla/5.0 (lq-flow-mcp)"})
-        with urllib.request.urlopen(req, timeout=30) as r:
-            res = json.loads(r.read().decode("utf-8", "replace"))
-    except Exception as exc:  # noqa: BLE001
-        return {"ok": False, "error": str(exc)[:200]}
-    items = ((res.get("RESULTS") or {}).get("list") or [])
-    out = []
-    for it in items:
-        out.append({
-            "单号": it.get("PROC_ATT2"), "流程": it.get("PROC_NAME"),
-            "发起人": it.get("AUTH_NAME"), "发起时间": it.get("PROC_STAR"),
-            "当前步骤": it.get("CUR_ACTI"), "当前处理人": it.get("CUR_RECI_NAME"),
-            "PROC_ID": it.get("PROC_ID"),
-        })
-    return {"ok": bool(res.get("success")), "count": len(out), "flows": out}
+            "报表名称": item.get("报表名称"), "数据源": src, "可信度": conf,
+            "preview": preview}
 
 
 @mcp.tool()
