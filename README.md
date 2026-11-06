@@ -229,8 +229,12 @@ oa_flow_list(2036, status=2)   # 2=在办，返回单号/发起人/当前处理�
 
 | 来源 | 抓取方式 | 数量 |
 |---|---|---|
-| ERP 数据库 | `refresh_catalog("db")`：扫 `hjappmenu` + 系统对象表 | 657 |
+| 经销商库 lqcerp | `refresh_catalog("db")`：扫 `hjappmenu` + 系统对象 | 657 |
+| **ERP 三期 lqerp** | `refresh_catalog("erp")`：本机 `.19` 的 `hjappmenu`（2300+ 菜单） | 2162 |
 | DMS 网页版 | `refresh_catalog("web")`：调 `MenuServlet`（需 dms_login.py） | 99 |
+
+每个条目带 `库` 字段（`lqcerp` / `lqerp`），导出时自动走对应的库：
+`lqcerp` 通过链接服务器 `lqcerp_lnk`，`lqerp` 走本机连接。
 
 | 类型 | 数量 | 含义 |
 |---|---|---|
@@ -336,9 +340,9 @@ ERP 的 `invalid_flag` 不可靠（大量作废代码仍为 0），所以不用�
 
 | 规则 | 行为 |
 |---|---|
-| 同一 table_id/数据源 对应多个报表名 | **直接拒绝**，返回候选列表，必须人工指定 |
+| 同一底表被多个报表共用 | 用 `expect_name` **精确消歧**：唯一匹配才放行，否则拒绝并列出候选 |
 | `expect_name` 与目录登记名不符 | **直接拒绝**（`expect_name` 为必填） |
-| 匹配方式为「包含」（猜出来的底表） | 默认拒绝，确需导出要显式 `allow_fuzzy=True` |
+| 匹配方式为「包含」「窗口推断」（猜出来的底表） | 默认拒绝，确需导出要显式 `allow_fuzzy=True` |
 | 每次导出返回 `preview`（前 3 行）+ 报表名 + 数据源 | 便于当场核对是否导错 |
 
 另外 `report_catalog` 命中多条时返回 `ambiguous: true` 并提示"禁止自行挑选"。

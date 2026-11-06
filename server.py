@@ -711,11 +711,33 @@ def _catalog_raw() -> dict:
 
 def _load_catalog() -> list[dict]:
     data = _catalog_raw()
-    return list(data.get("db") or []) + list(data.get("web") or [])
+    return (list(data.get("db") or []) + list(data.get("erp") or [])
+            + list(data.get("web") or []))
+
+
+def _resolve_obj(tid: str, objs: list[str], procs: set[str], curated: dict):
+    if tid in curated:
+        kind, src = curated[tid]
+        return kind, src, "人工"
+    if tid in objs:
+        return "table", tid, "精确"
+    suf = [o for o in objs if o.endswith(tid)]
+    if suf:
+        return "table", sorted(suf, key=len)[0], "后缀"
+    key = tid[2:] if tid.startswith("d_") else tid
+    cont = [o for o in objs if key and key in o]
+    if cont:
+        return "table", sorted(cont, key=len)[0], "包含"
+    if ("proc_" + tid) in procs:
+        return "proc", "proc_" + tid, "精确"
+    pre = [p for p in procs if p.startswith("proc_" + tid + "_")]
+    if pre:
+        return "proc", sorted(pre)[0], "前缀"
+    return "datawindow", None, "—"
 
 
 def _scan_db_catalog() -> list[dict]:
-    """从 ERP 菜单表 + 对象表生成报表目录（需要数据库账号）。"""
+    """三期经销商库 lqcerp（.86）的报表目录。"""
     conn = _connect(timeout=900)
     cur = conn.cursor()
     try:
@@ -733,36 +755,63 @@ def _scan_db_catalog() -> list[dict]:
         conn.close()
 
     objs = sorted(tables | views)
-
-    def resolve(tid: str):
-        if tid in _DB_CURATED:
-            kind, src = _DB_CURATED[tid]
-            return kind, src, "人工"
-        if tid in objs:
-            return "table", tid, "精确"
-        suf = [o for o in objs if o.endswith(tid)]
-        if suf:
-            return "table", sorted(suf, key=len)[0], "后缀"
-        key = tid[2:] if tid.startswith("d_") else tid
-        cont = [o for o in objs if key and key in o]
-        if cont:
-            return "table", sorted(cont, key=len)[0], "包含"
-        if ("proc_" + tid) in procs:
-            return "proc", "proc_" + tid, "精确"
-        pre = [p for p in procs if p.startswith("proc_" + tid + "_")]
-        if pre:
-            return "proc", sorted(pre)[0], "前缀"
-        return "datawindow", None, "—"
-
     out = []
     for mid, name, tid, win in menus:
         tid = (tid or "").strip()
         if not tid:
             continue
-        kind, src, how = resolve(tid)
+        kind, src, how = _resolve_obj(tid, objs, procs, _DB_CURATED)
         out.append({"menu_id": mid, "报表名称": (name or "").strip(), "table_id": tid,
                     "窗口": (win or "").strip(), "类型": kind, "数据源": src,
-                    "匹配方式": how, "来源": "ERP数据库"})
+                    "匹配方式": how, "来源": "ERP数据库", "库": "lqcerp"})
+    return out
+
+
+def _scan_erp_catalog() -> list[dict]:
+    """本机 lqerp（.19，一期/三期 ERP）的报表目录。
+
+    table_id 为空时，尝试从窗口名推断底表（如 w_app_saft04_2019 -> saft04），
+    这类推断标记为「窗口推断」，可信度低，导出需显式确认。
+    """
+    conn = _connect(timeout=900)
+    cur = conn.cursor()
+    try:
+        cur.execute("""select rtrim(menu_id), rtrim(menu_name),
+                              rtrim(isnull(table_id,'')), rtrim(isnull(model_window,''))
+                       from hjappmenu""")
+        menus = cur.fetchall()
+        cur.execute("select rtrim(name) from sys.tables")
+        tables = {r[0] for r in cur.fetchall()}
+        cur.execute("select rtrim(name) from sys.views")
+        views = {r[0] for r in cur.fetchall()}
+        cur.execute("select rtrim(name) from sys.procedures")
+        procs = {r[0] for r in cur.fetchall()}
+    finally:
+        conn.close()
+
+    objs = sorted(tables | views)
+    out = []
+    for mid, name, tid, win in menus:
+        tid = (tid or "").strip()
+        win = (win or "").strip()
+        if tid:
+            kind, src, how = _resolve_obj(tid, objs, procs, {})
+        else:
+            # 从窗口名推断：w_app_<表名>[_后缀]
+            src, kind, how = None, "datawindow", "—"
+            m = re.match(r"w_app_([a-zA-Z][A-Za-z0-9_]+)", win)
+            if m:
+                cand = m.group(1)
+                for cut in re.split(r"_\d{4}$|_\d+$", cand):
+                    if cut in objs:
+                        src, kind, how = cut, "table", "窗口推断"
+                        break
+        if kind == "datawindow" and not tid:
+            continue
+        out.append({"menu_id": mid, "报表名称": (name or "").strip(),
+                    "table_id": tid or (src or ""), "窗口": win,
+                    "类型": kind, "数据源": src, "匹配方式": how,
+                    "来源": "ERP三期", "库": "lqerp"})
     return out
 
 
@@ -813,6 +862,13 @@ def refresh_catalog(sources: str = "all") -> dict:
             result["db_count"] = len(db_items)
         except Exception as exc:  # noqa: BLE001
             result["db_error"] = str(exc)[:200]
+    if sources in ("all", "erp"):
+        try:
+            erp_items = _scan_erp_catalog()
+            data["erp"] = erp_items
+            result["erp_count"] = len(erp_items)
+        except Exception as exc:  # noqa: BLE001
+            result["erp_error"] = str(exc)[:200]
     if sources in ("all", "web"):
         try:
             web_items = _scan_web_catalog()
@@ -885,10 +941,13 @@ def report_detail(name_or_id: str) -> dict:
         conn = _connect(timeout=300)
         cur = conn.cursor()
         try:
-            cur.execute(
-                "select c.name from lqcerp_lnk.lqcerp.sys.columns c "
-                "join lqcerp_lnk.lqcerp.sys.objects o on c.object_id=o.object_id "
-                "where o.name=%s order by c.column_id", (src,))
+            if item.get("库") == "lqerp":
+                cur.execute("select c.name from sys.columns c where c.object_id=OBJECT_ID(%s) order by c.column_id", (src,))
+            else:
+                cur.execute(
+                    "select c.name from lqcerp_lnk.lqcerp.sys.columns c "
+                    "join lqcerp_lnk.lqcerp.sys.objects o on c.object_id=o.object_id "
+                    "where o.name=%s order by c.column_id", (src,))
             out["columns"] = [r[0] for r in cur.fetchall()]
         finally:
             conn.close()
@@ -915,11 +974,18 @@ def export_catalog_table(table_id: str, expect_name: str, where: str = "",
              or (x.get("数据源") or "").strip() == tid]
     if not cands:
         return {"ok": False, "error": f"table_id 不在目录中：{tid}"}
-    names = sorted({(x.get("报表名称") or "").strip() for x in cands})
-    if len(names) > 1:
-        return {"ok": False, "error": "该 table_id 对应多个报表，先指定具体报表名",
-                "candidates": names}
-    item = cands[0]
+    want0 = (expect_name or "").strip()
+    if not want0:
+        return {"ok": False, "error": "必须提供 expect_name（报表中文名）用于校验",
+                "candidates": sorted({(x.get("报表名称") or "").strip() for x in cands})}
+    exact = [x for x in cands if (x.get("报表名称") or "").strip() == want0]
+    hit = exact or [x for x in cands if want0 in (x.get("报表名称") or "")]
+    if len(hit) != 1:
+        return {"ok": False,
+                "error": "报表名无法唯一定位该表，请用目录里的完整报表名",
+                "expect_name": want0,
+                "candidates": sorted({(x.get("报表名称") or "").strip() for x in cands})}
+    item = hit[0]
     if item.get("类型") != "table":
         return {"ok": False, "error": f"该条目类型为 {item.get('类型')}，不是可导出表"}
     conf = _confidence(item)
@@ -939,7 +1005,9 @@ def export_catalog_table(table_id: str, expect_name: str, where: str = "",
     for bad in (";", "--", "/*", "insert", "update", "delete", "drop", "alter", "exec"):
         if bad in cond.lower():
             return {"ok": False, "error": f"where 含不允许内容: {bad}"}
-    base = f"select * from lqcerp_lnk.lqcerp.dbo.[{src}] with(nolock)"
+    table_ref = (f"[{src}]" if item.get("库") == "lqerp"
+                 else f"lqcerp_lnk.lqcerp.dbo.[{src}]")
+    base = f"select * from {table_ref} with(nolock)"
     if cond:
         base += " where " + cond
 
@@ -956,7 +1024,7 @@ def export_catalog_table(table_id: str, expect_name: str, where: str = "",
     path = _write_xlsx(Path(out_path).expanduser(), cols, rows, sheet, total_row)
     return {"ok": True, "path": str(path), "rows": len(rows), "truncated": trunc,
             "报表名称": item.get("报表名称"), "数据源": src, "可信度": conf,
-            "preview": preview}
+            "来源": item.get("来源"), "库": item.get("库"), "preview": preview}
 
 
 @mcp.tool()
