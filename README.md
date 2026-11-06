@@ -147,6 +147,7 @@ MCP 侧对应工具：
 | `oa_status()` | OA 会话是否有效 |
 | `oa_menu(keyword?, limit?)` | OA 菜单树（扁平化） |
 | `oa_services(service, params?)` | 调用任意 OA 服务（`/exoa/services`） |
+| `oa_flow_list(formset_id?, status?, page_size?)` | 查 OA 流程实例（发起人/时间/当前步骤/当前处理人） |
 
 网页版流向报表链路（已验证）：
 
@@ -178,6 +179,15 @@ oa_services("OA.UserAddressBookService.getUserByUserId", '{"userId":"jiangkaihao
 ```
 
 token 随 OA 会话过期，失效时 `oa_status()` 会提示重跑 `oa_login.py`。
+
+查流程实例（默认「自由流程(2026)」）：
+
+```
+oa_flow_list(2036, status=2)   # 2=在办，返回单号/发起人/当前处理人
+```
+
+抓包辅助：`oa_record.py` 可启动带调试端口的浏览器，记录 OA 的 `/exoa/services` 调用，
+用于逆向未公开接口（产物 `~/.lq-oa-capture.json`）。
 
 ## 工具清单
 

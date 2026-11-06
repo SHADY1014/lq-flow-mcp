@@ -1281,6 +1281,113 @@ def oa_services(service: str, params: str = "") -> dict:
         return {"ok": False, "error": str(exc)[:200]}
 
 
+
+def _oa_post_json(path: str, payload: dict, timeout: int = 20) -> dict:
+    import urllib.request
+
+    data = _oa_session()
+    if not data.get("token"):
+        raise RuntimeError("没有 OA 会话，先运行 python3 oa_login.py")
+    cookie = "; ".join(f"{c['name']}={c['value']}" for c in data.get("cookies", []) if c.get("name"))
+    req = urllib.request.Request(
+        OA_BASE + path,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Cookie": cookie,
+                 "User-Agent": "Mozilla/5.0 (lq-flow-mcp)"},
+        method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        text = r.read().decode("utf-8", "replace")
+    try:
+        return json.loads(text)
+    except Exception:
+        return {"_raw": text[:500]}
+
+
+@mcp.tool()
+def oa_user(user_id: str) -> dict:
+    """按 OA 账号查用户（如 yangyinwen），返回姓名/部门。"""
+    try:
+        r = _oa_service("OA.UserAddressBookService.getUserByUserId", {"userId": user_id})
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)[:150]}
+    u = r.get("RESULTS") or {}
+    if not u.get("USER_NAME"):
+        return {"ok": False, "error": f"未找到用户：{user_id}"}
+    return {"ok": True, "账号": user_id, "姓名": u.get("USER_NAME"),
+            "部门": u.get("DEPT_NAME"), "手机": u.get("USER_MOBI")}
+
+
+@mcp.tool()
+def oa_send_message(to_user_id: str, content: str) -> dict:
+    """给 OA 用户发即时消息（会真实发出，请谨慎）。
+
+    to_user_id 是 OA 账号（如 yangyinwen），不是姓名；可先用 oa_user 确认。
+    """
+    data = _oa_session()
+    if not data.get("token"):
+        return {"ok": False, "error": "没有 OA 会话，先运行 python3 oa_login.py"}
+    me = data.get("user_code") or ""
+    payload = {
+        "username": data.get("user", ""), "avatar": "", "id": me,
+        "type": "friend", "mine": True, "content": content,
+        "fromid": me, "toid": to_user_id,
+    }
+    try:
+        res = _oa_post_json("/api/LayIm/SendMessage", payload)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)[:200]}
+    return {"ok": res.get("code") == 0, "to": to_user_id, "content": content,
+            "response": res}
+
+
+
+@mcp.tool()
+def oa_flow_list(formset_id: int = 2036, status: int = 2, page_size: int = 10,
+                 page: int = 1) -> dict:
+    """查询 OA 流程实例（默认「自由流程(2026)」，status=2 为在办）。
+
+    返回：发起人、发起时间、当前步骤、当前处理人、单号。
+    """
+    import urllib.parse
+    import urllib.request
+
+    data = _oa_session()
+    if not data.get("token"):
+        return {"ok": False, "error": "没有 OA 会话，先运行 python3 oa_login.py"}
+    qs = urllib.parse.urlencode({
+        "SERVICE": "OA.MissiveService.queryMissive.V2",
+        "HEADER": json.dumps({"device_id": "PC", "token": data["token"]}, ensure_ascii=False),
+        "rnd": "0.1",
+        "type": "10",
+        "queryCondition": json.dumps({
+            "orderByColumn": 1, "orderDirection": 1,
+            "formsetIds": [str(formset_id)],
+            "formSetInstStatus": status,
+            "pageSize": max(1, min(int(page_size), 50)),
+            "pageNum": max(1, int(page)),
+        }, ensure_ascii=False),
+        "formSetInstStatus": str(status),
+    }, quote_via=urllib.parse.quote)
+    cookie = "; ".join(f"{c['name']}={c['value']}" for c in data.get("cookies", []) if c.get("name"))
+    try:
+        req = urllib.request.Request(f"{OA_BASE}/exoa/services?{qs}",
+                                     headers={"Cookie": cookie, "User-Agent": "Mozilla/5.0 (lq-flow-mcp)"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            res = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)[:200]}
+    items = ((res.get("RESULTS") or {}).get("list") or [])
+    out = []
+    for it in items:
+        out.append({
+            "单号": it.get("PROC_ATT2"), "流程": it.get("PROC_NAME"),
+            "发起人": it.get("AUTH_NAME"), "发起时间": it.get("PROC_STAR"),
+            "当前步骤": it.get("CUR_ACTI"), "当前处理人": it.get("CUR_RECI_NAME"),
+            "PROC_ID": it.get("PROC_ID"),
+        })
+    return {"ok": bool(res.get("success")), "count": len(out), "flows": out}
+
+
 @mcp.tool()
 def run_report_proc(proc: str, param: str = " 3=3 ",
                     limit: int = 200, offset: int = 0) -> dict:
