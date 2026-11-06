@@ -120,7 +120,7 @@ python3 build_package.py
 3. 重启客户端，对 agent 说「跑一下 preflight」
 
 安装脚本会自动：装依赖 → 把配置复制到用户目录（600）→ 检测并注册到
-ZCode / Claude Desktop / Cursor → 做一次 1433 连通性检查。
+客户端 → **自动拉一次报表目录** → 做一次 1433 连通性检查。
 
 如果对方**没装经销商系统客户端**也没关系：懒人包不依赖客户端，账号已在包里；
 想换账号则删掉 `~/.lq-flow.env` 后运行 `python3 setup.py`（支持从客户端 ini 自动提取）。
@@ -195,7 +195,8 @@ token 随 OA 会话过期，失效时 `oa_status()` 会提示重跑 `oa_login.py
 | `run_report_proc(proc, param)` | 执行报表存储过程 |
 | `query_readonly(sql)` | 只读 SQL |
 | `export_query(sql, out_path)` | 任意查询结果导出 Excel |
-| `report_catalog(keyword?, kind?, only_exportable?)` | **经销商系统全部报表目录**（按系统菜单，不预设业务口径） |
+| `refresh_catalog(sources?)` | **从系统实时抓取报表目录**（`db`/`web`/`all`），缓存本机 |
+| `report_catalog(keyword?, kind?, only_exportable?)` | 查询报表目录（需先 refresh_catalog） |
 | `report_detail(name_or_id)` | 单个报表的登记信息 + 数据源字段 |
 | `export_catalog_table(table_id, where?, out_path)` | 按目录导出某张报表数据表（受白名单约束） |
 | `check_office_changes(months?)` | 对比近 N 个月实际出库办事处与 regions.json，列出新增/消失/改名 |
@@ -204,9 +205,8 @@ token 随 OA 会话过期，失效时 `oa_status()` 会提示重跑 `oa_login.py
 
 ### DMS 网页版目录
 
-`dms_web_catalog.json` 登记了 DMS 网页版（`http://192.168.199.26:9090/hjerp`）的 **99 个菜单**，
-类型标为 `web`（分组标 `group`），`report_catalog` 会与数据库目录合并返回，
-用 `来源` 字段区分（`ERP数据库` / `DMS网页版`）。
+运行 `refresh_catalog("web")` 后，DMS 网页版（`http://192.168.199.26:9090/hjerp`）的 **99 个菜单**
+会并入同一份目录，类型标 `web`（分组标 `group`），用 `来源` 字段区分。
 
 注意：网页版登录需要**图形验证码**，密码在前端 RSA 加密，MCP 无法无人值守登录；
 这些条目只用于"知道有这张表、去哪导"，不能通过 `export_catalog_table` 导出。
@@ -214,7 +214,13 @@ token 随 OA 会话过期，失效时 `oa_status()` 会提示重跑 `oa_login.py
 
 ### 报表目录
 
-目录由 ERP 自己的菜单表（`hjappmenu`）生成，`reports_catalog.json` 里共 **657 条**：
+目录**不随仓库分发**，首次使用时用 `refresh_catalog()` 从系统实时抓取，缓存在
+`~/.lq-flow-catalog.json`（600 权限）。这样仓库里不含任何报表名称/表名清单。
+
+| 来源 | 抓取方式 | 数量 |
+|---|---|---|
+| ERP 数据库 | `refresh_catalog("db")`：扫 `hjappmenu` + 系统对象表 | 657 |
+| DMS 网页版 | `refresh_catalog("web")`：调 `MenuServlet`（需 dms_login.py） | 99 |
 
 | 类型 | 数量 | 含义 |
 |---|---|---|
@@ -227,6 +233,7 @@ token 随 OA 会话过期，失效时 `oa_status()` 会提示重跑 `oa_login.py
 用法：
 
 ```
+refresh_catalog()          # 首次使用先跑这个（db 约 2 秒；web 需先 dms_login.py）
 report_catalog("O2O")                       # 按系统菜单名搜索
 report_catalog(kind="table", only_exportable=True)
 report_detail("O2O电商平台订单日报表")        # 看数据源和字段

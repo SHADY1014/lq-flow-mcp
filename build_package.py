@@ -20,7 +20,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 FILES = ["server.py", "setup.py", "install.py", "requirements.txt",
-         "regions.json", "reports_catalog.json", "dms_web_catalog.json",
+         "regions.json",
          "dms_login.py", "oa_login.py", "install.bat", "install.command"]
 PKG_DIR = "lq-flow-mcp"
 

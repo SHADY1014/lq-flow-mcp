@@ -122,8 +122,24 @@ def register_clients() -> None:
         line(f'    "lq-flow": {{"command": "{sys.executable}", "args": ["{SERVER}"]}}')
 
 
+def refresh_catalog() -> None:
+    """首次安装后自动拉一次报表目录（失败不阻塞）。"""
+    line("[4/5] 拉取报表目录（首次需要，约 2 秒）")
+    code = (
+        "import server,json;"
+        "print(json.dumps(server.refresh_catalog('db'),ensure_ascii=False))"
+    )
+    r = subprocess.run([sys.executable, "-c", code], cwd=str(HERE),
+                       capture_output=True, text=True)
+    if r.returncode == 0 and '"db_count"' in (r.stdout or ""):
+        line("  ✓ " + (r.stdout or "").strip()[:160])
+    else:
+        line("  · 目录稍后可手动刷新：在 agent 里说「跑一下 refresh_catalog」")
+        line("    " + ((r.stderr or r.stdout or "").strip()[-200:]))
+
+
 def check_conn() -> None:
-    line("[4/4] 连通性检查")
+    line("[5/5] 连通性检查")
     host = "192.168.199.19"
     if ENV_DST.exists():
         for raw in ENV_DST.read_text(encoding="utf-8").splitlines():
@@ -147,6 +163,7 @@ def main() -> int:
     if not ensure_env():
         return 2
     register_clients()
+    refresh_catalog()
     check_conn()
     return 0
 

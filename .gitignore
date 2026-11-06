@@ -6,3 +6,6 @@ __pycache__/
 .venv/
 .build/
 *.zip
+reports_catalog.json
+dms_web_catalog.json
+.lq-flow-catalog.json

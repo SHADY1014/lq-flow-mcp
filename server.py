@@ -689,36 +689,167 @@ def export_status(job_id: str) -> dict:
 
 
 
-# ---------------- 报表目录（全量登记）
-CATALOG_FILE = Path(__file__).resolve().parent / "reports_catalog.json"
-WEB_CATALOG_FILE = Path(__file__).resolve().parent / "dms_web_catalog.json"
+# ---------------- 报表目录（首次登录后从系统实时抓取）
+CATALOG_FILE = Path.home() / ".lq-flow-catalog.json"
+
+_DB_CURATED = {
+    "d_app_cinvout_zone_01": ("proc", "proc_d_app_cinvout_zone_01_new"),
+    "d_app_cinvout_zone_01_new": ("proc", "proc_d_app_cinvout_zone_01_new"),
+    "d_app_cinvout_zone_01_bi_dept": ("proc", "proc_d_app_cinvout_zone_01_new_bi_dept"),
+    "d_app_cinvout_zone_01_new2": ("table", "d_report_hjDMS_app_cinvout_zone_01_new2"),
+}
 
 
-def _load_catalog():
-    """合并两个来源：ERP 数据库目录 + DMS 网页版目录。"""
-    items = []
-    if CATALOG_FILE.exists():
-        for x in json.loads(CATALOG_FILE.read_text(encoding="utf-8")):
-            x.setdefault("来源", "ERP数据库")
-            items.append(x)
-    if WEB_CATALOG_FILE.exists():
-        items.extend(json.loads(WEB_CATALOG_FILE.read_text(encoding="utf-8")))
-    return items
+def _catalog_raw() -> dict:
+    if not CATALOG_FILE.exists():
+        return {}
+    try:
+        return json.loads(CATALOG_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _load_catalog() -> list[dict]:
+    data = _catalog_raw()
+    return list(data.get("db") or []) + list(data.get("web") or [])
+
+
+def _scan_db_catalog() -> list[dict]:
+    """从 ERP 菜单表 + 对象表生成报表目录（需要数据库账号）。"""
+    conn = _connect(timeout=900)
+    cur = conn.cursor()
+    try:
+        cur.execute("""select rtrim(menu_id), rtrim(menu_name),
+                              rtrim(isnull(table_id,'')), rtrim(isnull(model_window,''))
+                       from lqcerp_lnk.lqcerp.dbo.hjappmenu""")
+        menus = cur.fetchall()
+        cur.execute("select rtrim(name) from lqcerp_lnk.lqcerp.sys.tables")
+        tables = {r[0] for r in cur.fetchall()}
+        cur.execute("select rtrim(name) from lqcerp_lnk.lqcerp.sys.views")
+        views = {r[0] for r in cur.fetchall()}
+        cur.execute("select rtrim(name) from lqcerp_lnk.lqcerp.sys.procedures")
+        procs = {r[0] for r in cur.fetchall()}
+    finally:
+        conn.close()
+
+    objs = sorted(tables | views)
+
+    def resolve(tid: str):
+        if tid in _DB_CURATED:
+            kind, src = _DB_CURATED[tid]
+            return kind, src, "人工"
+        if tid in objs:
+            return "table", tid, "精确"
+        suf = [o for o in objs if o.endswith(tid)]
+        if suf:
+            return "table", sorted(suf, key=len)[0], "后缀"
+        key = tid[2:] if tid.startswith("d_") else tid
+        cont = [o for o in objs if key and key in o]
+        if cont:
+            return "table", sorted(cont, key=len)[0], "包含"
+        if ("proc_" + tid) in procs:
+            return "proc", "proc_" + tid, "精确"
+        pre = [p for p in procs if p.startswith("proc_" + tid + "_")]
+        if pre:
+            return "proc", sorted(pre)[0], "前缀"
+        return "datawindow", None, "—"
+
+    out = []
+    for mid, name, tid, win in menus:
+        tid = (tid or "").strip()
+        if not tid:
+            continue
+        kind, src, how = resolve(tid)
+        out.append({"menu_id": mid, "报表名称": (name or "").strip(), "table_id": tid,
+                    "窗口": (win or "").strip(), "类型": kind, "数据源": src,
+                    "匹配方式": how, "来源": "ERP数据库"})
+    return out
+
+
+def _scan_web_catalog() -> list[dict]:
+    """从 DMS 网页版菜单接口生成目录（需要 dms_login.py 的会话）。"""
+    import urllib.request
+
+    header = _dms_cookie_header()
+    if not header:
+        raise RuntimeError("没有 DMS 会话，先运行 python3 dms_login.py")
+    req = urllib.request.Request(f"{DMS_BASE}/servlet/MenuServlet?default=default&",
+                                 headers={"Cookie": header})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        raw = r.read().decode("utf-8", "replace")
+    try:
+        data = json.loads(raw)
+    except Exception:
+        raise RuntimeError("网页版会话已失效（返回的不是菜单 JSON），先运行 python3 dms_login.py")
+    roots = (data.get("dataSource") or {}).get("tree") or []
+
+    out: list[dict] = []
+
+    def walk(nodes, parent=""):
+        for n in nodes or []:
+            label = (n.get("label") or "").strip()
+            kids = n.get("tree") or []
+            out.append({"报表名称": label, "类型": "group" if kids else "web",
+                        "数据源": None, "来源": "DMS网页版", "上级": parent,
+                        "入口": f"{DMS_BASE}/indexServlet"})
+            walk(kids, label)
+
+    walk(roots)
+    return out
+
+
+@mcp.tool()
+def refresh_catalog(sources: str = "all") -> dict:
+    """从系统实时拉取报表目录并缓存到本机（不再随仓库分发）。
+
+    sources: all / db / web。db 需要数据库账号，web 需要 dms_login.py 的会话。
+    """
+    data = _catalog_raw()
+    result = {"ok": True, "path": str(CATALOG_FILE)}
+    if sources in ("all", "db"):
+        try:
+            db_items = _scan_db_catalog()
+            data["db"] = db_items
+            result["db_count"] = len(db_items)
+        except Exception as exc:  # noqa: BLE001
+            result["db_error"] = str(exc)[:200]
+    if sources in ("all", "web"):
+        try:
+            web_items = _scan_web_catalog()
+            data["web"] = web_items
+            result["web_count"] = len(web_items)
+        except Exception as exc:  # noqa: BLE001
+            result["web_error"] = str(exc)[:200]
+
+    data["updated_at"] = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if data.get("db") or data.get("web"):
+        CATALOG_FILE.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        os.chmod(CATALOG_FILE, 0o600)
+        result["ok"] = True
+    else:
+        result["ok"] = False
+    return result
 
 
 @mcp.tool()
 def report_catalog(keyword: str | None = None, kind: str | None = None,
                    only_exportable: bool = False, limit: int = 100) -> dict:
-    """经销商系统全部报表菜单目录。kind: table/proc/datawindow。"""
+    """经销商系统报表目录（首次使用需先 refresh_catalog）。kind: table/proc/datawindow/web。"""
     items = _load_catalog()
+    if not items:
+        return {"count": 0, "need_refresh": True,
+                "hint": "目录为空：先运行 refresh_catalog()（需要数据库账号；抓网页版还需 dms_login.py）"}
     kw = (keyword or "").strip()
     if kw:
-        items = [x for x in items if kw in x.get("报表名称", "") or kw in x.get("table_id", "")]
+        items = [x for x in items
+                 if kw in x.get("报表名称", "") or kw in x.get("table_id", "")
+                 or kw in (x.get("上级") or "")]
     if kind:
         items = [x for x in items if x.get("类型") == kind]
     if only_exportable:
         items = [x for x in items if x.get("类型") in ("table", "proc")]
-    return {"count": len(items), "reports": items[:max(1, min(limit, 700))]}
+    return {"count": len(items), "updated_at": _catalog_raw().get("updated_at"),
+            "reports": items[:max(1, min(limit, 800))]}
 
 
 @mcp.tool()
@@ -728,7 +859,7 @@ def report_detail(name_or_id: str) -> dict:
     hit = [x for x in _load_catalog()
            if key and (key in x.get("报表名称", "") or key == x.get("table_id"))]
     if not hit:
-        return {"ok": False, "error": f"未找到报表：{key}"}
+        return {"ok": False, "error": f"未找到报表：{key}（目录可能未刷新，先跑 refresh_catalog）"}
     item = hit[0]
     out = {"ok": True, **item}
     src = item.get("数据源")
@@ -751,7 +882,7 @@ def export_catalog_table(table_id: str, where: str = "", out_path: str = "",
                          sheet: str = "数据", total_row: bool = False,
                          limit: int = 200000) -> dict:
     """导出报表目录里登记的表。where 为可选 SQL 条件（只允许比较/IN/LIKE）。"""
-    cat = {x["table_id"]: x for x in _load_catalog()}
+    cat = {x["table_id"]: x for x in _load_catalog() if x.get("table_id")}
     item = cat.get((table_id or "").strip())
     if not item or item.get("类型") != "table":
         return {"ok": False, "error": "该 table_id 不在目录中或不是表类型，先用 report_catalog 查"}
@@ -769,7 +900,6 @@ def export_catalog_table(table_id: str, where: str = "", out_path: str = "",
     path = _write_xlsx(Path(out_path).expanduser(), cols, rows, sheet, total_row)
     return {"ok": True, "path": str(path), "rows": len(rows), "truncated": trunc,
             "source": src, "match": item.get("匹配方式")}
-
 
 
 # ---------------------------------------------------------------- 办事处变更检测/同步
