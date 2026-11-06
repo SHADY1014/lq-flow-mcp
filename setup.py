@@ -3,18 +3,18 @@
 漓泉 cERP MCP —— 首次安装配置向导
 
 流程：
-  1. 检查 VPN 连通性（连不上直接提示先连公司 VPN）
-  2. 自动扫描本机和佳客户端目录（hjapp.ini / hjapp1.ini / hjsoft.ini），
-     提取数据库连接并逐个试连；自动区分明文密码与密文
-  3. 没装客户端 / 扫描不到，自动转手工输入数据库账号
-  4. 登录失败时给出针对性诊断（客户端账号误用、账号锁定、VPN 断开等）
+  1. 检查 VPN 连通性
+  2. 扫描和佳客户端 ini（hjapp1.ini 明文优先），收集凭据与目标库
+  3. 交叉试连（明文密码 × 主机/库），并**限制尝试次数**，避免把账号试锁
+  4. 失败时按 SQL Server 错误码给结论（18456 密码错 / 18486 账号被锁 / 超时 VPN）
   5. 成功后写入 ~/.lq-flow.env（权限 600）
 
 用法：
   python3 setup.py                  # 自动扫描 + 试连 + 保存
   python3 setup.py --ini <路径>      # 指定某个 ini
-  python3 setup.py --manual         # 跳过扫描，直接手工输入
+  python3 setup.py --manual         # 跳过扫描，手工输入
   python3 setup.py --check          # 只做连通性自检
+  python3 setup.py --diag           # 只诊断，不写配置
 """
 import getpass
 import os
@@ -28,14 +28,15 @@ DEFAULT_PORT = int(os.getenv("LQ_DB_PORT", "1433"))
 DEFAULT_DB = os.getenv("LQ_DB_NAME", "lqerp")
 ENV_FILE = Path.home() / ".lq-flow.env"
 
-# 常见安装目录（Windows 为主；其它平台用 --ini 指定）
 SEARCH_DIRS = [
     r"D:\经销商应用系统", r"D:\ERP应用系统", r"D:\hjerp",
     r"C:\经销商应用系统", r"C:\ERP应用系统", r"C:\hjerp",
     r"C:\Program Files\经销商应用系统", r"C:\Program Files (x86)\经销商应用系统",
 ]
-# hjapp1.ini 常存明文，优先读取
 INI_NAMES = ["hjapp1.ini", "hjapp.ini", "hjsoft.ini"]
+
+# 连续失败上限：超过就停，避免把共享账号试锁（这是 18456 扩散的常见原因）
+MAX_ATTEMPTS = 4
 
 
 # ------------------------------------------------------------------ 基础
@@ -54,14 +55,17 @@ def check_vpn(host: str, port: int) -> bool:
         print("  ✓ 内网可达")
         return True
     print(f"  ✗ 不可达（{err}）")
-    print("    请先连接公司 VPN（TopSAP 天融信 或 EasyConnect 深信服），")
-    print("    确认能访问公司内网后重新运行。")
+    print("    请先连接公司 VPN（TopSAP / EasyConnect），确认能访问内网后重试。")
     return False
+
+
+def is_client_account(user: str) -> bool:
+    """纯数字 6-12 位 → 大概率是经销商系统软件登录账号，不是 SQL 登录。"""
+    return bool(re.fullmatch(r"\d{6,12}", (user or "").strip()))
 
 
 # ------------------------------------------------------------------ ini 解析
 def parse_ini(path: Path) -> list[dict]:
-    """解析和佳 ini，返回 [{host, db, user, passwd, plain, section, file}]。"""
     try:
         raw = path.read_bytes()
     except OSError:
@@ -111,13 +115,13 @@ def parse_ini(path: Path) -> list[dict]:
         pwd = it.get("passwd", "")
         out.append({
             "host": it["host"], "db": it["db"], "user": it.get("user", ""), "passwd": pwd,
-            "plain": bool(re.search(r"[A-Za-z]", pwd)),  # 纯长数字串视为密文
+            "plain": bool(re.search(r"[A-Za-z]", pwd)),
             "section": it.get("section", ""), "file": it.get("file", ""),
         })
     return out
 
 
-def collect_candidates(explicit: str | None) -> list[dict]:
+def scan_ini(explicit: str | None) -> list[dict]:
     files: list[Path] = []
     if explicit:
         files.append(Path(explicit).expanduser())
@@ -130,8 +134,7 @@ def collect_candidates(explicit: str | None) -> list[dict]:
                 p = base / name
                 if p.exists():
                     files.append(p)
-            for p in base.glob("*/hjapp.ini"):
-                files.append(p)
+            files.extend(base.glob("*/hjapp.ini"))
     seen, out = set(), []
     for f in files:
         for it in parse_ini(f):
@@ -141,6 +144,24 @@ def collect_candidates(explicit: str | None) -> list[dict]:
             seen.add(key)
             out.append(it)
     return out
+
+
+def build_plan(items: list[dict]) -> tuple[list[tuple], list[tuple]]:
+    """返回 (凭据集合, 目标集合)，目标按 .19/lqerp 优先排序。"""
+    creds = []
+    for it in items:
+        if it["plain"]:
+            key = (it["user"], it["passwd"])
+            if key not in creds:
+                creds.append(key)
+    targets = []
+    for it in items:
+        key = (it["host"], it["db"])
+        if key not in targets:
+            targets.append(key)
+    default = (DEFAULT_HOST, DEFAULT_DB)
+    targets = [default] + [t for t in targets if t != default]
+    return creds, targets
 
 
 # ------------------------------------------------------------------ 连接与诊断
@@ -162,33 +183,29 @@ def try_login(host: str, port: int, db: str, user: str, pwd: str) -> tuple[bool,
         return False, str(exc)
 
 
-def explain_failure(user: str, host: str, db: str, err: str) -> list[str]:
-    tips, e = [], err.lower()
+def classify(err: str) -> tuple[str, str]:
+    """返回 (类型, 结论提示)。"""
+    e = (err or "").lower()
+    if "18486" in e or "锁定" in err or "locked" in e:
+        return "locked", "账号已被锁定（连续失败过多）。等 15 分钟或让 DBA 执行 ALTER LOGIN ... WITH PASSWORD 解锁后重试。"
     if "18456" in e or "登录失败" in err or "login failed" in e:
-        if re.fullmatch(r"\d{6,12}", user or ""):
-            tips.append(f"账号 '{user}' 是纯数字，很像【客户端软件登录账号】（如 00010013 / 22020005），"
-                        "不是数据库账号。数据库账号通常是 erp 或 sa。")
-            tips.append("客户端登录账号只用于打开软件，不能直连数据库。")
-        tips.append("账号或密码不正确。数据库密码与软件登录密码通常不是同一个。")
-        tips.append("若已连续失败多次，SQL Server 可能临时锁定该账号：等几分钟，或联系 DBA 解锁。")
-    elif "timeout" in e or "timed out" in e or "20009" in e:
-        tips.append("连接超时：VPN 可能断了，或主机/端口不通。重连 VPN 后再试。")
-    elif "4060" in e or "cannot open database" in e:
-        tips.append(f"账号能登录但打不开库 '{db}'：库名不对或没有该库权限。")
-    elif "20002" in e or "tds" in e:
-        tips.append("TDS 握手失败：可能连到了非 SQL Server 端口，确认主机和端口。")
-    return tips
+        return "badcred", "账号或密码不对；或账号被锁（锁定时也常回 18456）。别再连续重试。"
+    if "timeout" in e or "timed out" in e or "20009" in e:
+        return "network", "连接超时：VPN 断了或主机/端口不通。"
+    if "4060" in e or "cannot open database" in e:
+        return "nodatabase", "账号能登录但库打不开：库名不对或没有该库权限。"
+    if "20002" in e or "tds" in e:
+        return "tds", "TDS 握手失败：可能连到了非 SQL Server 端口。"
+    return "other", "未知错误，见上方原文。"
 
 
-# ------------------------------------------------------------------ 保存
 def write_env(host: str, port: int, db: str, user: str, pwd: str) -> None:
-    out = Path.home() / "Desktop" / "货物流向导出"
     ENV_FILE.write_text(
         "# 漓泉 cERP MCP 配置（本机私有，勿提交到仓库）\n"
         f"LQ_DB_HOST={host}\nLQ_DB_PORT={port}\nLQ_DB_USER={user}\n"
         f"LQ_DB_PASSWORD={pwd}\nLQ_DB_NAME={db}\n"
         "LQ_LINK=lqcerp_lnk\n"
-        f"LQ_OUT_DIR={out}\n", encoding="utf-8")
+        f"LQ_OUT_DIR={Path.home() / 'Desktop' / '货物流向导出'}\n", encoding="utf-8")
     os.chmod(ENV_FILE, 0o600)
     print(f"\n[4/4] ✓ 配置已保存：{ENV_FILE}（权限 600）")
 
@@ -202,34 +219,44 @@ def print_register() -> None:
     print("保存后重启客户端，对 agent 说「跑一下 preflight」即可验证。")
 
 
+def print_lockout_help() -> None:
+    print("\n结论：这个共享账号很可能已经被多次失败试锁了（18456 常见于此）。")
+    print("  1. 停止继续尝试，等 15 分钟再试；")
+    print("  2. 或让 DBA 解锁：ALTER LOGIN [erp] WITH PASSWORD = '<原密码>'；")
+    print("  3. 最省事的办法：找发放人拿「懒人包」，里面已带可用账号，安装时零输入。")
+
+
 # ------------------------------------------------------------------ 主流程
 def manual_input(host_hint: str, port: int) -> int:
     print("\n[4/4] 手工输入数据库账号")
-    print("  说明：这里要【数据库账号】（和佳 ini 里的 LogId / LogPass），")
-    print("        不是经销商系统的软件登录账号；两者不是一回事。")
+    print("  要的是【数据库账号】（和佳 ini 里的 LogId / LogPass），不是软件登录账号。")
     host = input(f"  主机 [{host_hint}]: ").strip() or host_hint
     db = input(f"  数据库 [{DEFAULT_DB}]: ").strip() or DEFAULT_DB
     user = input("  用户名: ").strip()
+    if is_client_account(user):
+        print(f"  ✗ '{user}' 是纯数字，属于经销商系统软件登录账号，SQL Server 不认。")
+        print("    数据库账号通常是 erp（或 sa），请查 hjapp1.ini 的 LogId。")
+        return 3
     pwd = getpass.getpass("  密码: ")
     ok, msg = try_login(host, port, db, user, pwd)
-    if not ok:
-        print(f"  ✗ 登录失败：{msg[:200]}")
-        for tip in explain_failure(user, host, db, msg):
-            print(f"    · {tip}")
-        print("\n  如果拿不到数据库账号，向 IT / 系统管理员申请：")
-        print("    - lqerp 库的只读账号")
-        print("    - 链接服务器 lqcerp_lnk 的访问权限")
-        return 3
-    print(f"  ✓ 成功：{msg}")
-    write_env(host, port, db, user, pwd)
-    print_register()
-    return 0
+    if ok:
+        print(f"  ✓ 成功：{msg}")
+        write_env(host, port, db, user, pwd)
+        print_register()
+        return 0
+    kind, hint = classify(msg)
+    print(f"  ✗ 登录失败：{msg[:200]}")
+    print(f"    → {hint}")
+    if kind in ("badcred", "locked"):
+        print_lockout_help()
+    return 3
 
 
 def main() -> int:
     import argparse
     ap = argparse.ArgumentParser(description="漓泉 cERP MCP 安装向导")
     ap.add_argument("--check", action="store_true", help="只做连通性自检")
+    ap.add_argument("--diag", action="store_true", help="只诊断，不写配置")
     ap.add_argument("--ini", help="指定和佳 ini 文件路径")
     ap.add_argument("--manual", action="store_true", help="跳过扫描，手工输入")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
@@ -243,49 +270,71 @@ def main() -> int:
         check_vpn(DEFAULT_HOST, args.port)
         return 0
 
-    # 1) VPN
-    cands = [] if args.manual else collect_candidates(args.ini)
-    host_hint = cands[0]["host"] if cands else DEFAULT_HOST
+    items = [] if args.manual else scan_ini(args.ini)
+    host_hint = items[0]["host"] if items else DEFAULT_HOST
     if not check_vpn(host_hint, args.port):
         return 2
 
-    # 2) 扫描客户端配置
     if args.manual:
         print("\n[2/4] 已跳过客户端配置扫描（--manual）")
-    elif not cands:
+    elif not items:
         print("\n[2/4] 未找到和佳客户端配置")
-        print("  没装经销商系统也可以使用，只是需要手工输入数据库账号；")
-        print("  如果本机装过客户端但不在默认目录，可用 --ini 指定 hjapp.ini 路径。")
+        print("  没装经销商系统也能用，但需要手工输入数据库账号；")
+        print("  装过但不在默认目录的，可用 --ini 指定 hjapp1.ini 路径。")
     else:
-        print(f"\n[2/4] 扫描到 {len(cands)} 组连接信息")
-        for it in cands:
+        print(f"\n[2/4] 扫描到 {len(items)} 条连接信息")
+        for it in items:
             tag = "明文" if it["plain"] else "密文"
             print(f"  - {it['host']}/{it['db']} user={it['user']} 密码({tag}) "
                   f"来源={Path(it['file']).name}[{it['section']}]")
 
-    # 3) 逐个试连
-    tried = set()
-    if cands:
-        print("\n[3/4] 尝试连接数据库")
-        for it in cands:
-            if not it["plain"]:
-                print(f"  · {it['host']}/{it['db']}: 密码是密文（客户端启动时才解密），跳过")
-                continue
-            key = (it["host"], it["db"], it["user"], it["passwd"])
-            if key in tried:
-                continue
-            tried.add(key)
-            ok, msg = try_login(it["host"], args.port, it["db"], it["user"], it["passwd"])
-            if ok:
-                print(f"  ✓ 成功：{it['host']}/{it['db']} user={it['user']}（{msg}）")
-                write_env(it["host"], args.port, it["db"], it["user"], it["passwd"])
-                print_register()
-                return 0
-            print(f"  ✗ 失败：{it['host']}/{it['db']} user={it['user']} → {msg[:120]}")
-            for tip in explain_failure(it["user"], it["host"], it["db"], msg):
-                print(f"      · {tip}")
+    # 3) 交叉试连（有次数上限）
+    creds, targets = build_plan(items)
+    attempts = 0
+    badcred_by_user: dict[str, int] = {}
+    first_failure: tuple[str, str] | None = None
+    if creds and targets:
+        print("\n[3/4] 交叉试连（每次失败都会累计到账号锁定阈值，已限制次数）")
+        for host, db in targets:
+            for user, pwd in creds:
+                if is_client_account(user):
+                    print(f"  · 跳过 {user}（纯数字=客户端账号，SQL 不认）")
+                    continue
+                if attempts >= MAX_ATTEMPTS:
+                    print(f"  · 已达尝试上限 {MAX_ATTEMPTS} 次，停止，避免把账号试锁")
+                    break
+                attempts += 1
+                ok, msg = try_login(host, args.port, db, user, pwd)
+                if ok:
+                    print(f"  ✓ 成功：{host}/{db} user={user}（{msg}）")
+                    if not args.diag:
+                        write_env(host, args.port, db, user, pwd)
+                        print_register()
+                    return 0
+                kind, hint = classify(msg)
+                print(f"  ✗ {host}/{db} user={user} → {msg[:90]}")
+                print(f"      → {hint}")
+                if first_failure is None:
+                    first_failure = (kind, msg)
+                if kind in ("badcred", "locked"):
+                    badcred_by_user[user] = badcred_by_user.get(user, 0) + 1
+                    # 同一账号连续 2 次密码错误就停，避免把共享账号试锁
+                    if badcred_by_user[user] >= 2 or kind == "locked":
+                        print(f"  · 账号 {user} 已连续失败 {badcred_by_user[user]} 次，停止尝试")
+                        print_lockout_help()
+                        return 3
+            if attempts >= MAX_ATTEMPTS:
+                break
 
-    return manual_input(host_hint, args.port)
+    if args.diag:
+        print("\n[done] 诊断结束（--diag，未写配置）")
+        return 0 if not attempts else 3
+
+    # 4) 手工
+    rc = manual_input(host_hint, args.port)
+    if rc != 0 and first_failure and first_failure[0] in ("badcred", "locked"):
+        print_lockout_help()
+    return rc
 
 
 if __name__ == "__main__":
