@@ -41,6 +41,18 @@ python3 setup.py
 
 账号密码**不会**出现在仓库里，也不会被打印。
 
+如果发放人已经直接给了你数据库账号，跳过扫描一步装完（把 `***` 换成实际密码）：
+
+```bash
+python3 setup.py --user erp --password '***'
+```
+
+也可以不给 `--password`，改用环境变量，避免密码留在 shell 历史里：
+
+```bash
+LQ_DB_PASSWORD='***' python3 setup.py --user erp
+```
+
 只想检查网络、不改配置：
 
 ```bash
@@ -389,6 +401,15 @@ LQ_DB_CHARSET=cp936
 > 归档目录（`D:\安装\...`、`D:\公司资源\...`）里也常留副本。
 
 拿到后：跑 `setup.py` 或直接写 `~/.lq-flow.env`（600），再 `preflight` 验证。
+
+**最快路径**：找发放人问一句「cERP 的库账号密码」，拿到后一条命令装完：
+
+```bash
+python3 setup.py --user erp --password '***'     # 密码问发放人
+```
+
+Windows 上不确定密码对不对，先加 `--diag` 只验证不写配置：
+`python setup.py --diag --user erp --password '***'`，输出 `✓ 成功：db=lqerp login=erp` 就说明通了。
 
 ## 常见问题
 

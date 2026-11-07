@@ -13,6 +13,7 @@
   python3 setup.py                  # 自动扫描 + 试连 + 保存
   python3 setup.py --ini <路径>      # 指定某个 ini
   python3 setup.py --manual         # 跳过扫描，手工输入
+  python3 setup.py --user erp --password ***   # 直接给凭据，一行装完（推荐发给新同事）
   python3 setup.py --check          # 只做连通性自检
   python3 setup.py --diag           # 只诊断，不写配置
 """
@@ -289,19 +290,54 @@ def main() -> int:
     ap.add_argument("--diag", action="store_true", help="只诊断，不写配置")
     ap.add_argument("--ini", help="指定和佳 ini 文件路径")
     ap.add_argument("--manual", action="store_true", help="跳过扫描，手工输入")
+    ap.add_argument("--user", help="直接指定数据库用户名（如 erp），跳过 ini 扫描")
+    ap.add_argument("--password", help="直接指定数据库密码；也可用环境变量 LQ_DB_PASSWORD")
+    ap.add_argument("--host", help=f"数据库主机，默认 {DEFAULT_HOST}")
+    ap.add_argument("--db", help=f"数据库名，默认 {DEFAULT_DB}")
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     args = ap.parse_args()
+
+    user = (args.user or "").strip()
+    pwd = args.password if args.password is not None else os.getenv("LQ_DB_PASSWORD", "")
+    host = (args.host or DEFAULT_HOST).strip()
+    db = (args.db or DEFAULT_DB).strip()
 
     print("=" * 60)
     print(" 漓泉 cERP MCP —— 安装配置向导")
     print("=" * 60)
 
     if args.check:
-        check_vpn(DEFAULT_HOST, args.port)
+        check_vpn(host, args.port)
         return 0
 
+    # 直接给凭据：不扫盘、不试错，只连一次
+    if user and pwd:
+        if is_client_account(user):
+            print(f"\n✗ '{user}' 是纯数字，属于经销商系统软件登录账号，SQL Server 不认。")
+            print("  要的是 hjapp1.ini 里的 LogId / LogPass（通常是 erp）。")
+            return 3
+        if not check_vpn(host, args.port):
+            return 2
+        print(f"\n[2/4] 跳过扫描（已指定 --user）")
+        print(f"\n[3/4] 试连 {host}:{args.port}/{db} user={user}")
+        ok, msg = try_login(host, args.port, db, user, pwd)
+        if ok:
+            print(f"  ✓ 成功：{msg}")
+            if args.diag:
+                print("\n[done] 诊断结束（--diag，未写配置）")
+                return 0
+            write_env(host, args.port, db, user, pwd)
+            print_register()
+            return 0
+        kind, hint = classify(msg)
+        print(f"  ✗ 登录失败：{msg[:200]}")
+        print(f"    → {hint}")
+        if kind in ("badcred", "locked"):
+            print_lockout_help()
+        return 3
+
     items = [] if args.manual else scan_ini(args.ini)
-    host_hint = items[0]["host"] if items else DEFAULT_HOST
+    host_hint = items[0]["host"] if items else host
     if not check_vpn(host_hint, args.port):
         return 2
 
