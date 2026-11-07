@@ -146,6 +146,36 @@ def scan_ini(explicit: str | None) -> list[dict]:
     return out
 
 
+def deep_scan_ini(timeout: int = 25, max_depth: int = 4) -> list[Path]:
+    """默认目录找不到时，浅层扫 D:/C: 等盘找 hjapp1.ini（明文版）。
+
+    限制递归深度与耗时，避免卡住；跳过系统目录。
+    """
+    import time
+
+    skip = ("windows", "program files", "program files (x86)", "programdata",
+            "users", "$recycle.bin", "system volume information", "appdata")
+    found: list[Path] = []
+    if os.name != "nt":
+        return found
+    roots = [Path(f"{d}:\\") for d in "CDEF" if Path(f"{d}:\\").exists()]
+    t0 = time.time()
+    for root in roots:
+        base_depth = len(root.parts)
+        for dirpath, dirnames, filenames in os.walk(root):
+            if time.time() - t0 > timeout:
+                return found
+            cur = Path(dirpath)
+            if len(cur.parts) - base_depth >= max_depth:
+                dirnames[:] = []
+                continue
+            dirnames[:] = [d for d in dirnames if d.lower() not in skip][:80]
+            for fn in filenames:
+                if fn.lower() in ("hjapp1.ini", "hjapp.ini", "hjsoft.ini"):
+                    found.append(cur / fn)
+    return found
+
+
 def build_plan(items: list[dict]) -> tuple[list[tuple], list[tuple]]:
     """返回 (凭据集合, 目标集合)，目标按 .19/lqerp 优先排序。"""
     creds = []
@@ -278,9 +308,28 @@ def main() -> int:
     if args.manual:
         print("\n[2/4] 已跳过客户端配置扫描（--manual）")
     elif not items:
-        print("\n[2/4] 未找到和佳客户端配置")
-        print("  没装经销商系统也能用，但需要手工输入数据库账号；")
-        print("  装过但不在默认目录的，可用 --ini 指定 hjapp1.ini 路径。")
+        print("\n[2/4] 默认目录未找到和佳客户端配置，正在浅层扫描磁盘（最多 25 秒）...")
+        found = deep_scan_ini()
+        if found:
+            print(f"  找到 {len(found)} 个候选配置文件：")
+            for f in found[:6]:
+                print(f"    - {f}")
+            items = []
+            for f in found:
+                items.extend(parse_ini(f))
+            seen = set()
+            uniq = []
+            for it in items:
+                k = (it["host"], it["db"], it["user"], it["passwd"])
+                if k not in seen:
+                    seen.add(k)
+                    uniq.append(it)
+            items = uniq
+        if not items:
+            print("  仍未找到可用的明文配置。下一步二选一：")
+            print("    1) 向发放人要「懒人包」（包内已带账号，零输入）")
+            print("    2) 找 IT/DBA 要 lqerp 的只读数据库账号")
+            print("  也可用 --ini 指定某个 hjapp1.ini 路径。")
     else:
         print(f"\n[2/4] 扫描到 {len(items)} 条连接信息")
         for it in items:
