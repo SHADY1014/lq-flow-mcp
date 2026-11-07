@@ -136,6 +136,8 @@ def _connect(autocommit=False, database=None, timeout=3600):
         server=DB_HOST, port=DB_PORT, user=DB_USER, password=DB_PASSWORD,
         database=database or DB_NAME, tds_version="7.0",
         login_timeout=10, timeout=timeout, autocommit=autocommit,
+        # 本库 varchar 列存的是 GBK 字节，不指定会被按 utf8 误解码成乱码
+        charset=os.getenv("LQ_DB_CHARSET", "cp936"),
     )
 
 
@@ -1149,6 +1151,415 @@ def preflight() -> dict:
         else:
             result["advice"] = "VPN 在跑但库不可达，检查线路或被防火墙拦截"
     return result
+
+
+
+# ---------------------------------------------------------------- 办事处变更检测/同步
+_VOID_PAT = re.compile(r"作废|失效|停用|虚拟|测试|已删除")
+
+
+def _is_void(name: str) -> bool:
+    return bool(_VOID_PAT.search(name or ""))
+
+
+def _erp_active_offices(months: int = 3) -> dict:
+    conn = _connect(timeout=600)
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """select distinct rtrim(zone_id) as code
+               from cinvout_02 with(nolock)
+               where sts_flag='S'
+                 and out_time >= dateadd(month, -%s, getdate())
+                 and rtrim(isnull(zone_id,'')) <> ''""", (int(months),))
+        codes = [r[0] for r in cur.fetchall()]
+        cur.execute("""select rtrim(dept_id), rtrim(dept_name), rtrim(isnull(sdept_id,''))
+                       from ctlm1003 with(nolock) where len(rtrim(dept_id))=6""")
+        info = {r[0]: {"name": r[1], "parent": r[2]} for r in cur.fetchall()}
+        return {c: info.get(c, {}).get("name", "") for c in codes}
+    finally:
+        conn.close()
+
+
+def _json_offices() -> dict:
+    out = {}
+    for comp, dq, o in _iter_offices():
+        code = str(o.get("ERP代码") or "").strip()
+        if code:
+            out[code] = {"名称": o["名称"], "分公司": comp, "大区": dq}
+    return out
+
+
+@mcp.tool()
+def check_office_changes(months: int = 3) -> dict:
+    """对比「近 N 个月实际出库的办事处」与 regions.json，列出新增/消失/改名。"""
+    erp = _erp_active_offices(months)
+    js = _json_offices()
+    raw_new = sorted(set(erp) - set(js))
+    new = [c for c in raw_new if not _is_void(erp.get(c, ""))]
+    ignored = [c for c in raw_new if _is_void(erp.get(c, ""))]
+    gone = sorted(set(js) - set(erp))
+    renamed = [{"代码": c, "原名称": js[c]["名称"], "ERP名称": erp[c]}
+               for c in sorted(set(erp) & set(js))
+               if erp[c] and _norm(erp[c]) != _norm(js[c]["名称"])]
+    return {"对比月份数": months, "ERP出库办事处数": len(erp),
+            "regions.json办事处数": len(js),
+            "新增": [{"代码": c, "名称": erp[c]} for c in new],
+            "忽略的作废代码数": len(ignored),
+            "消失": [{"代码": c, "名称": js[c]["名称"], "分公司": js[c]["分公司"], "大区": js[c]["大区"]} for c in gone],
+            "改名": renamed,
+            "结论": "无变化" if not (new or gone or renamed) else "有变化，确认后执行 refresh_regions(apply=True)"}
+
+
+@mcp.tool()
+def refresh_regions(apply: bool = False, months: int = 3) -> dict:
+    """把新增办事处补进 regions.json（默认 dry-run）。"""
+    erp = _erp_active_offices(months)
+    js = _json_offices()
+    new = [c for c in sorted(set(erp) - set(js)) if not _is_void(erp.get(c, ""))]
+    if not new:
+        return {"ok": True, "changed": 0, "message": "没有新增办事处，无需写入"}
+    plan = [{"代码": c, "名称": erp[c], "分公司": "待确认", "大区": "待确认"} for c in new]
+    if not apply:
+        return {"ok": True, "changed": 0, "dry_run": True, "will_add": plan}
+    data = json.loads(REGIONS_FILE.read_text(encoding="utf-8"))
+    bucket = (data.setdefault("分公司", {}).setdefault("待确认", {})
+              .setdefault("大区", {}).setdefault("待确认", []))
+    existing = {str(x.get("ERP代码")) for x in bucket}
+    for item in plan:
+        if item["代码"] not in existing:
+            bucket.append({"名称": item["名称"], "OA部门编码": "", "ERP代码": item["代码"]})
+    data["更新时间"] = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    REGIONS_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
+    return {"ok": True, "changed": len(plan), "added": plan, "file": str(REGIONS_FILE)}
+
+
+# ---------------------------------------------------------------- DMS 网页版（Cookie 会话）
+DMS_BASE = os.getenv("LQ_DMS_BASE", "http://192.168.199.26:9090/hjerp")
+DMS_COOKIE = Path.home() / ".lq-dms.cookie"
+
+
+def _dms_cookie_header() -> str | None:
+    """读取 dms_login.py 保存的会话 Cookie（含 HttpOnly）。"""
+    if not DMS_COOKIE.exists():
+        return None
+    try:
+        data = json.loads(DMS_COOKIE.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    cookies = data.get("cookies") or []
+    return "; ".join(f"{c['name']}={c['value']}" for c in cookies) or None
+
+
+@mcp.tool()
+def dms_status() -> dict:
+    """检查 DMS 网页版会话是否有效（Cookie 由 dms_login.py 生成）。"""
+    import urllib.request
+    if not DMS_COOKIE.exists():
+        return {"logged_in": False, "advice": "运行 python3 dms_login.py 登录一次"}
+    header = _dms_cookie_header()
+    try:
+        req = urllib.request.Request(f"{DMS_BASE}/indexServlet", headers={"Cookie": header or ""})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            ok = r.status == 200 and len(r.read(200)) > 0
+        saved = json.loads(DMS_COOKIE.read_text(encoding="utf-8")).get("saved_at")
+        return {"logged_in": ok, "base": DMS_BASE, "saved_at": saved,
+                "advice": "会话有效" if ok else "会话已失效，重跑 dms_login.py"}
+    except Exception as exc:  # noqa: BLE001
+        return {"logged_in": False, "base": DMS_BASE, "error": str(exc)[:150],
+                "advice": "会话失效或网络不通，重跑 dms_login.py"}
+
+
+@mcp.tool()
+def dms_fetch(path: str, params: str = "", save_to: str = "", limit: int = 200000) -> dict:
+    """带 Cookie 请求 DMS 网页接口。二进制响应需给 save_to。"""
+    import urllib.request
+    header = _dms_cookie_header()
+    if not header:
+        return {"ok": False, "error": "没有会话 Cookie，先运行 python3 dms_login.py"}
+    url = f"{DMS_BASE}/{path.lstrip('/')}"
+    if params:
+        url += ("&" if "?" in url else "?") + params.lstrip("?")
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers={"Cookie": header}), timeout=60) as r:
+            ctype = r.headers.get("Content-Type", "")
+            raw = r.read(limit)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)[:200], "url": url}
+    if any(k in ctype.lower() for k in ("excel", "spreadsheet", "octet-stream")):
+        if not save_to:
+            return {"ok": False, "error": "响应是二进制，请提供 save_to", "content_type": ctype}
+        out = Path(save_to).expanduser()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_bytes(raw)
+        return {"ok": True, "saved": str(out), "bytes": len(raw)}
+    text = raw.decode("utf-8", "replace")
+    res = {"ok": True, "content_type": ctype, "bytes": len(raw), "url": url}
+    try:
+        res["json"] = json.loads(text)
+    except Exception:
+        res["text"] = text[:4000]
+    return res
+
+
+DMS_REPORT_BASE = os.getenv("LQ_DMS_REPORT_BASE", "http://192.168.199.26:9095/hjreport")
+DMS_FLOW_RPT = "d_sale/d_report_sale_2dcinvout_detail.rptdesign"
+
+
+def _dms_meta() -> tuple[str, str]:
+    data = json.loads(DMS_COOKIE.read_text(encoding="utf-8")) if DMS_COOKIE.exists() else {}
+    return data.get("user_id", ""), _dms_cookie_header() or ""
+
+
+@mcp.tool()
+def dms_flow_report(year: int, month: int, day: int | None = None,
+                    dept_code: str | None = None, dept_name: str | None = None,
+                    out_dir: str | None = None, file_name: str | None = None,
+                    keep_raw: bool = True) -> dict:
+    """导出 DMS 网页版「二级货物流向明细表」（BIRT，按月/日、可按办事处）。"""
+    import calendar
+    import urllib.parse
+    import urllib.request
+    import xml.etree.ElementTree as ET
+
+    uid, cookie = _dms_meta()
+    if not cookie:
+        return {"ok": False, "error": "没有 DMS 会话，先运行 python3 dms_login.py"}
+    if not dept_code and dept_name:
+        for comp, dq, o in _iter_offices():
+            if _norm(o["名称"]) == _norm(dept_name):
+                dept_code = str(o.get("ERP代码") or "").strip()
+                break
+    start = dt.date(year, month, day or 1)
+    end = dt.date(year, month, day) if day else dt.date(year, month, calendar.monthrange(year, month)[1])
+    cond = f"a.date_out >= '{start}' and a.date_out <= '{end}'"
+    perm = (f"(g.id_dept in(select id_dept from ctlm1221 where id_user = '{uid}' "
+            f"and id_user in(select id_user from ctlm1203 where id_post in (select id_post from ctlm1004 where flag_post = 'I' ))) "
+            f"<br/>or<br/>a.id_corr in (select id_corr from ctlm1127 where id_user = '{uid}' "
+            f"and id_user in(select id_user from ctlm1203 where id_post in (select id_post from ctlm1004 where flag_post = 'O' ))))")
+    sql = f"{cond} and {perm}"
+    if dept_code:
+        sql += f" and g.id_dept = '{dept_code}'"
+    sql = sql.replace("<br/>", "\n")
+    qs = urllib.parse.urlencode({"__report": DMS_FLOW_RPT, "__format": "xls",
+                                 "reportArg": sql, "userid": uid})
+    try:
+        with urllib.request.urlopen(urllib.request.Request(
+                f"{DMS_REPORT_BASE}/frameset?{qs}",
+                headers={"Cookie": cookie}), timeout=300) as r:
+            raw = r.read()
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)[:200]}
+    NS = "{urn:schemas-microsoft-com:office:spreadsheet}"
+    try:
+        root = ET.fromstring(raw)
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"返回不是 Excel XML：{exc}"[:200], "bytes": len(raw)}
+    rows = []
+    for r in root.findall(f".//{NS}Row"):
+        vals = []
+        for c in r.findall(f"{NS}Cell"):
+            idx = c.get(f"{NS}Index")
+            if idx:
+                vals.extend([""] * (int(idx) - 1 - len(vals)))
+            d = c.find(f"{NS}Data")
+            vals.append(d.text if d is not None and d.text is not None else "")
+        rows.append(vals)
+    if not rows:
+        return {"ok": False, "error": "报表为空"}
+    import openpyxl
+    from openpyxl.styles import Font, Alignment, PatternFill
+    name = file_name or (f"货物流向_{(dept_code or '全部')}_{start:%Y%m%d}"
+                         + ("" if day else f"-{end:%Y%m%d}") + "_网页版.xlsx")
+    path = Path(out_dir or DEFAULT_OUT) / name
+    wb = openpyxl.Workbook(); ws = wb.active; ws.title = "货物流向"
+    fill = PatternFill("solid", fgColor="DDEBF7")
+    for ri, row in enumerate(rows, start=1):
+        ws.append(row)
+        if ri == 2:
+            for ci in range(1, len(row) + 1):
+                c = ws.cell(ri, ci)
+                c.font = Font(bold=True); c.fill = fill
+                c.alignment = Alignment(horizontal="center")
+    ws.freeze_panes = "A3"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(path)
+    if keep_raw:
+        path.with_suffix(".raw.xls").write_bytes(raw)
+    total = None
+    for v in rows[-1]:
+        try:
+            total = float(v); break
+        except (TypeError, ValueError):
+            continue
+    return {"ok": True, "path": str(path), "rows": max(0, len(rows) - 3),
+            "dept": dept_code or "全部", "date_from": str(start), "date_to": str(end),
+            "total": total}
+
+
+# ---------------------------------------------------------------- OA 协同办公
+OA_BASE = os.getenv("LQ_OA_BASE", "https://oa.lqp9.cn")
+OA_SESSION = Path.home() / ".lq-oa.cookie"
+
+
+def _oa_session() -> dict:
+    if not OA_SESSION.exists():
+        return {}
+    try:
+        return json.loads(OA_SESSION.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _oa_service(service: str, params: dict | None = None, timeout: int = 30) -> dict:
+    """调用 OA /exoa/services（只认 HEADER token）。"""
+    import urllib.parse
+    import urllib.request
+    data = _oa_session()
+    token = data.get("token", "")
+    if not token:
+        raise RuntimeError("没有 OA 会话，先运行 python3 oa_login.py")
+    qs = urllib.parse.urlencode({
+        "SERVICE": service,
+        "HEADER": json.dumps({"device_id": "PC", "token": token}, ensure_ascii=False),
+        "PARAMS": json.dumps(params or {}, ensure_ascii=False),
+    }, quote_via=urllib.parse.quote)
+    req = urllib.request.Request(f"{OA_BASE}/exoa/services?{qs}",
+                                 headers={"User-Agent": "Mozilla/5.0 (lq-flow-mcp)"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        text = r.read().decode("utf-8", "replace")
+    try:
+        return json.loads(text)
+    except Exception:
+        return {"_raw": text[:2000]}
+
+
+@mcp.tool()
+def oa_status() -> dict:
+    """检查 OA 会话是否有效（token 由 oa_login.py 生成）。"""
+    data = _oa_session()
+    if not data.get("token"):
+        return {"logged_in": False, "advice": "运行 python3 oa_login.py 登录一次"}
+    try:
+        res = _oa_service("OA.MenuService.getAllRooMenusOfUser")
+        menus = (res.get("RESULTS") or {}).get("list") or []
+        return {"logged_in": bool(menus), "user": data.get("user", ""),
+                "user_code": data.get("user_code", ""), "saved_at": data.get("saved_at"),
+                "top_menus": [m.get("name") for m in menus][:10],
+                "advice": "会话有效" if menus else "会话可能失效，重跑 oa_login.py"}
+    except Exception as exc:  # noqa: BLE001
+        return {"logged_in": False, "error": str(exc)[:150], "advice": "会话失效，重跑 oa_login.py"}
+
+
+@mcp.tool()
+def oa_menu(keyword: str | None = None, limit: int = 300) -> dict:
+    """OA 菜单树（扁平化）。"""
+    res = _oa_service("OA.MenuService.getAllRooMenusOfUser")
+    roots = (res.get("RESULTS") or {}).get("list") or []
+    items: list[dict] = []
+
+    def walk(node, parent=""):
+        for m in node or []:
+            name = (m.get("name") or "").strip()
+            items.append({"名称": name, "编码": (m.get("code") or "").strip(),
+                          "id": m.get("id"), "上级": parent,
+                          "地址": (m.get("viewUrl") or "").split("?")[0]})
+            walk(m.get("subMenus"), name)
+
+    walk(roots)
+    kw = (keyword or "").strip()
+    if kw:
+        items = [x for x in items if kw in x["名称"] or kw in x["编码"]]
+    return {"count": len(items), "menus": items[:max(1, min(limit, 500))]}
+
+
+@mcp.tool()
+def oa_services(service: str, params: str = "") -> dict:
+    """调用任意 OA 服务，如 "OA.UserAddressBookService.getUserByUserId"。"""
+    try:
+        p = json.loads(params) if params else {}
+    except Exception:
+        return {"ok": False, "error": "params 不是合法 JSON"}
+    try:
+        return {"ok": True, "service": service, "result": _oa_service(service, p)}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)[:200]}
+
+
+@mcp.tool()
+def oa_user(user_id: str) -> dict:
+    """按 OA 账号查用户（如 yangyinwen）。"""
+    try:
+        r = _oa_service("OA.UserAddressBookService.getUserByUserId", {"userId": user_id})
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)[:150]}
+    u = r.get("RESULTS") or {}
+    if not u.get("USER_NAME"):
+        return {"ok": False, "error": f"未找到用户：{user_id}"}
+    return {"ok": True, "账号": user_id, "姓名": u.get("USER_NAME"),
+            "部门": u.get("DEPT_NAME"), "手机": u.get("USER_MOBI")}
+
+
+@mcp.tool()
+def oa_send_message(to_user_id: str, content: str) -> dict:
+    """给 OA 用户发即时消息（会真实发出）。注意：LayIM 依赖对方在线，可能不投递。"""
+    import urllib.request
+    data = _oa_session()
+    if not data.get("token"):
+        return {"ok": False, "error": "没有 OA 会话，先运行 python3 oa_login.py"}
+    me = data.get("user_code") or ""
+    cookie = "; ".join(f"{c['name']}={c['value']}" for c in data.get("cookies", []) if c.get("name"))
+    payload = {"username": data.get("user", ""), "avatar": "", "id": me, "type": "friend",
+               "mine": True, "content": content, "fromid": me, "toid": to_user_id}
+    try:
+        req = urllib.request.Request(
+            f"{OA_BASE}/api/LayIm/SendMessage",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Cookie": cookie,
+                     "User-Agent": "Mozilla/5.0 (lq-flow-mcp)"}, method="POST")
+        with urllib.request.urlopen(req, timeout=20) as r:
+            res = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)[:200]}
+    return {"ok": res.get("code") == 0, "to": to_user_id, "content": content, "response": res}
+
+
+@mcp.tool()
+def oa_flow_list(formset_id: int = 2036, status: int = 2, page_size: int = 10,
+                 page: int = 1) -> dict:
+    """查询 OA 流程实例（默认「自由流程(2026)」，status=2 为在办）。"""
+    import urllib.parse
+    import urllib.request
+    data = _oa_session()
+    if not data.get("token"):
+        return {"ok": False, "error": "没有 OA 会话，先运行 python3 oa_login.py"}
+    qs = urllib.parse.urlencode({
+        "SERVICE": "OA.MissiveService.queryMissive.V2",
+        "HEADER": json.dumps({"device_id": "PC", "token": data["token"]}, ensure_ascii=False),
+        "rnd": "0.1", "type": "10",
+        "queryCondition": json.dumps({
+            "orderByColumn": 1, "orderDirection": 1,
+            "formsetIds": [str(formset_id)], "formSetInstStatus": status,
+            "pageSize": max(1, min(int(page_size), 50)), "pageNum": max(1, int(page)),
+        }, ensure_ascii=False),
+        "formSetInstStatus": str(status),
+    }, quote_via=urllib.parse.quote)
+    cookie = "; ".join(f"{c['name']}={c['value']}" for c in data.get("cookies", []) if c.get("name"))
+    try:
+        req = urllib.request.Request(f"{OA_BASE}/exoa/services?{qs}",
+                                     headers={"Cookie": cookie, "User-Agent": "Mozilla/5.0 (lq-flow-mcp)"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            res = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": str(exc)[:200]}
+    out = []
+    for it in ((res.get("RESULTS") or {}).get("list") or []):
+        out.append({"单号": it.get("PROC_ATT2"), "流程": it.get("PROC_NAME"),
+                    "发起人": it.get("AUTH_NAME"), "发起时间": it.get("PROC_STAR"),
+                    "当前步骤": it.get("CUR_ACTI"), "当前处理人": it.get("CUR_RECI_NAME"),
+                    "PROC_ID": it.get("PROC_ID")})
+    return {"ok": bool(res.get("success")), "count": len(out), "flows": out}
+
 
 
 if __name__ == "__main__":

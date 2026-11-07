@@ -194,6 +194,8 @@ oa_flow_list(2036, status=2)   # 2=在办，返回单号/发起人/当前处理�
 | 工具 | 用途 |
 |---|---|
 | `preflight()` | 连通性自检：VPN/隧道/数据库是否正常 |
+| `check_office_changes(months?)` | 对比近 N 个月实际出库办事处与 regions.json |
+| `refresh_regions(apply?, months?)` | 把新增办事处补进 regions.json（默认 dry-run） |
 | `list_regions(company?, region?)` | 按分公司/大区/别名（如「广西」）列办事处 |
 | `list_offices(year?, month?)` | ERP 办事处清单 |
 | `list_reports(keyword?, only_runnable?)` | 报表菜单清单，标注哪些能直连 |
@@ -205,6 +207,8 @@ oa_flow_list(2036, status=2)   # 2=在办，返回单号/发起人/当前处理�
 | `run_report_proc(proc, param)` | 执行报表存储过程 |
 | `query_readonly(sql)` | 只读 SQL |
 | `export_query(sql, out_path)` | 任意查询结果导出 Excel |
+| `dms_status()` / `dms_fetch(path)` / `dms_flow_report(...)` | 网页版会话、接口、流向报表导出 |
+| `oa_status()` / `oa_menu()` / `oa_services()` / `oa_user()` / `oa_send_message()` / `oa_flow_list()` | OA 会话、菜单、服务、用户、发消息、流程查询 |
 | `refresh_catalog(sources?)` | **从系统实时抓取报表目录**（`db`/`web`/`all`），缓存本机 |
 | `report_catalog(keyword?, kind?, only_exportable?)` | 查询报表目录（需先 refresh_catalog） |
 | `report_detail(name_or_id)` | 单个报表的登记信息 + 数据源字段 |
@@ -350,6 +354,25 @@ ERP 的 `invalid_flag` 不可靠（大量作废代码仍为 0），所以不用�
 
 **调用约定**：先 `report_catalog` 拿到确切 `table_id` 和中文名，再把两者一起传给
 `export_catalog_table`，不要凭关键字猜表。
+
+
+### 自检（回归）
+
+```bash
+python3 selftest.py
+```
+
+覆盖 5 项：工具齐全（>=27）、`refresh_catalog('web')` 不抛 NameError、数据库连通、
+varchar 中文解码、错名导出被拒并给候选。提交前跑一遍。
+
+### 中文乱码
+
+本库部分 `varchar` 列存的是 **GBK 字节**。`_connect()` 默认已按 `cp936` 连接；
+若仍有乱码，用环境变量覆盖：
+
+```bash
+LQ_DB_CHARSET=cp936
+```
 
 ## 常见问题
 
