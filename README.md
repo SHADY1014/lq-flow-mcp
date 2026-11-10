@@ -6,6 +6,22 @@
 
 ---
 
+## ⛔ 使用铁律：只读 + 导出（不可协商）
+
+**这个 MCP 只做「查数 + 导出」，任何时候都不写库。**
+
+- 只允许 `SELECT` / `WITH` 查询与 xlsx 导出；`INSERT / UPDATE / DELETE / MERGE / TRUNCATE / DROP / ALTER / CREATE / EXEC / 授权 / DBCC / 备份恢复` 一律禁止。
+- **即使数据库账号是 `db_owner` / `sysadmin` 高权限账号，也不得借它越权修改数据库内容。** 账号权限高 ≠ 可以写；需要改数据（主数据修正、单据调整、价格维护等）走 OA / DMS 正式流程，不要用本 MCP 代劳。
+- `run_report_proc` 的 `param`、`export_catalog_table` 的 `where` 只接受**条件片段**，代码已硬编码拦截 `;`、`--`、`/* */`、写关键字与 `xp_*`/`sp_*`，防止借参数注入写语句。
+- 正确姿势永远是：**读出来 → `export_query` / `flow_export` 落到本机 xlsx → 人工在系统里走流程**。
+- `preflight()` 会回显当前数据库账号及其 `sysadmin` / `db_owner` 身份，便于核对；即使有写权限，MCP 侧仍强制只读。
+
+代码实现（`server.py`）：`READONLY_POLICY` / `FORBIDDEN` / `FRAGMENT_FORBIDDEN` / `_check_sql` / `_check_fragment`。**改代码只许收紧，不许放宽。**
+
+> 唯一例外：`_ensure_rpc_out()` 首次调用时会把链接服务器 `lqcerp_lnk` 的 `rpc out` 打开（`sp_serveroption`），属于连接选项、不是业务数据；不开就没法 `EXEC(...) AT link` 调报表过程。除此之外不做任何写入。
+
+---
+
 ## 前置条件
 
 | 项 | 要求 |
@@ -432,4 +448,6 @@ Windows 上不确定密码对不对，先加 `--diag` 只验证不写配置：
 - 仓库内**不含**任何账号、密码。
 - 密码只保存在本机 `~/.lq-flow.env`（600 权限）。
 - 换机器需要重新跑 `python3 setup.py`。
-- `query_readonly` 只放行 `SELECT/WITH`，拦截写操作与执行类关键字。
+- `query_readonly` 只放行 `SELECT/WITH`，拦截写操作与执行类关键字（含 `openrowset`/`dbcc`/`waitfor` 等）。
+- `run_report_proc` 的 `param`、`export_catalog_table` 的 `where` 有独立的片段校验，禁止分号、注释与写关键字。
+- **只读是硬约束，不靠账号权限兜底**：哪怕连库账号是 `sysadmin`，MCP 也不会代你执行任何写操作。详见开头《使用铁律》。

@@ -18,6 +18,12 @@
   query_readonly      只读 SQL（默认 lqerp，可用四段名跨库）
   export_query        SQL / 存储过程结果导出 xlsx
 
+只读铁律:
+  本 MCP 只做「读取 + 导出」，禁止任何写库/改库/授权/执行类操作；
+  即使 LQ_DB_USER 是 db_owner / sysadmin 高权限账号也不得越权改数。
+  规则代码化在 READONLY_POLICY / FORBIDDEN / FRAGMENT_FORBIDDEN，
+  改代码只能收紧，不许放宽。
+
 环境变量(或用 ~/.lq-flow.env):
   LQ_DB_HOST / LQ_DB_PORT / LQ_DB_USER / LQ_DB_PASSWORD / LQ_DB_NAME
   LQ_LINK= lqcerp_lnk   LQ_OUT_DIR= 导出目录
@@ -120,9 +126,47 @@ SUMMARY_FIELDS = [
 
 FORBIDDEN = re.compile(
     r"\b(insert|update|delete|drop|alter|create|truncate|merge|exec|execute|"
-    r"grant|deny|revoke|backup|restore|shutdown|xp_cmdshell|sp_configure|bulk)\b",
+    r"grant|deny|revoke|backup|restore|shutdown|xp_cmdshell|sp_configure|bulk|"
+    r"dbcc|kill|waitfor|openrowset|opendatasource|openquery|reconfigure|"
+    r"attach|detach)\b",
     re.I,
 )
+
+
+# ---------------------------------------------------------------- 只读铁律
+# 本网关只做「读取 + 导出」，任何情况下都不得对数据库做写操作。即使
+# LQ_DB_USER 配的是高权限账号（db_owner / sysadmin），也不得借它越权改数；
+# 需要改数据一律走 OA / DMS 正式流程，不要用本 MCP 代劳。
+# 下面两个正则就是这条规则的代码实现，改代码时只许收紧，不许放宽。
+READONLY_POLICY = (
+    "lq-flow 只读铁律：只允许查询(SELECT/WITH)与导出 xlsx，"
+    "禁止 INSERT/UPDATE/DELETE/MERGE/TRUNCATE/DROP/ALTER/CREATE/EXEC/"
+    "授权/DBCC/备份恢复等一切写库与执行类操作；"
+    "高权限账号同样受限，需要改数据请走 OA/DMS 正式流程。"
+)
+
+# 片段级防护：run_report_proc 的 param、export_catalog_table 的 where 会拼进 SQL，
+# 必须挡住注释符、语句分隔符和写关键字，防止借参数注入写语句。
+FRAGMENT_FORBIDDEN = re.compile(
+    r"(;|--|/\*|\*/|\b(insert|update|delete|drop|alter|create|truncate|merge|"
+    r"exec|execute|grant|deny|revoke|backup|restore|shutdown|dbcc|waitfor|"
+    r"kill|bulk|openrowset|opendatasource|openquery|reconfigure|"
+    r"xp_\w+|sp_\w+)\b)",
+    re.I,
+)
+
+
+def _check_fragment(text: str, field: str = "条件片段") -> str:
+    """校验拼进 SQL 的条件片段，命中写操作/注释/分号直接拒绝。"""
+    s = (text or "").strip()
+    if not s:
+        return s
+    m = FRAGMENT_FORBIDDEN.search(s)
+    if m:
+        raise ValueError(
+            f"{field}含不允许内容: {m.group(0)}｜{READONLY_POLICY}"
+        )
+    return s
 
 
 # ---------------------------------------------------------------- DB 基础
@@ -146,7 +190,11 @@ _rpc_ready = False
 
 
 def _ensure_rpc_out(cur):
-    """链接服务器 rpc out 只需打开一次；并发时只让一个线程去改。"""
+    """链接服务器 rpc out 只需打开一次；并发时只让一个线程去改。
+
+    这是「只读铁律」唯一的例外：只改本机链接服务器的连接选项 rpc out，
+    不改任何业务数据/表结构。没有它就无法通过 EXEC(...) AT link 调报表过程。
+    """
     global _rpc_ready
     if _rpc_ready:
         return
@@ -359,11 +407,11 @@ def _check_sql(sql: str) -> str:
     if ";" in s:
         raise ValueError("只允许单条语句")
     if not re.match(r"(?is)^\s*(select|with)\b", s):
-        raise ValueError("只允许 SELECT / WITH 查询")
+        raise ValueError("只允许 SELECT / WITH 查询｜" + READONLY_POLICY)
     if FORBIDDEN.search(s):
-        raise ValueError("包含被禁止的关键字（写操作/执行/权限）")
+        raise ValueError("包含被禁止的关键字（写操作/执行/权限）｜" + READONLY_POLICY)
     if re.search(r"(?is)\binto\s+[\[\w#]", s):
-        raise ValueError("不允许 SELECT INTO")
+        raise ValueError("不允许 SELECT INTO｜" + READONLY_POLICY)
     return s
 
 
@@ -1003,10 +1051,10 @@ def export_catalog_table(table_id: str, expect_name: str, where: str = "",
                 "expect_name": want, "目录登记": item.get("报表名称")}
 
     src = item["数据源"]
-    cond = (where or "").strip()
-    for bad in (";", "--", "/*", "insert", "update", "delete", "drop", "alter", "exec"):
-        if bad in cond.lower():
-            return {"ok": False, "error": f"where 含不允许内容: {bad}"}
+    try:
+        cond = _check_fragment(where, "where ")
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}
     table_ref = (f"[{src}]" if item.get("库") == "lqerp"
                  else f"lqcerp_lnk.lqcerp.dbo.[{src}]")
     base = f"select * from {table_ref} with(nolock)"
@@ -1032,11 +1080,13 @@ def export_catalog_table(table_id: str, expect_name: str, where: str = "",
 @mcp.tool()
 def run_report_proc(proc: str, param: str = " 3=3 ",
                     limit: int = 200, offset: int = 0) -> dict:
-    """执行 .86 上的 proc_ 报表存储过程。param 是 @Param1 的条件片段，例如
-    " 3=3 and a.out_time >= '2026-10-01' and a.out_time < '2026-11-01' "。"""
+    """执行 .86 上的 proc_ 报表存储过程（只读取数）。param 是 @Param1 的条件片段，例如
+    " 3=3 and a.out_time >= '2026-10-01' and a.out_time < '2026-11-01' "。
+    param 只接受条件片段，含分号/注释/写关键字会被直接拒绝。"""
     p = (proc or "").strip()
     if not re.match(r"^proc_[A-Za-z0-9_]+$", p):
         raise ValueError("只允许 proc_ 开头的存储过程名")
+    prm = _check_fragment(str(param), "param ")
     conn = _connect(timeout=300)
     cur = conn.cursor()
     try:
@@ -1045,7 +1095,7 @@ def run_report_proc(proc: str, param: str = " 3=3 ",
             raise ValueError(f"存储过程不存在: {p}")
     finally:
         conn.close()
-    command = f"use lqcerp; exec dbo.{p} @Param1='" + str(param).replace("'", "''") + "'"
+    command = f"use lqcerp; exec dbo.{p} @Param1='" + prm.replace("'", "''") + "'"
     cols, rows = _exec_remote(_remote_exec_string(command))
     lim = max(1, min(int(limit), 2000))
     page = rows[offset:offset + lim]
@@ -1130,8 +1180,27 @@ def preflight() -> dict:
         sock = socket.create_connection((DB_HOST, DB_PORT), timeout=5)
         sock.close()
         result["db_reachable"] = True
+        # 只读铁律自查：账号权限高≠可以写库，这里把账号身份暴露出来以便核对
+        try:
+            conn = _connect(autocommit=True, timeout=30)
+            cur = conn.cursor()
+            cur.execute("select SUSER_NAME(), IS_SRVROLEMEMBER('sysadmin'), "
+                        "IS_MEMBER('db_owner')")
+            u, sa, dbown = cur.fetchone()
+            conn.close()
+            result["db_account"] = {
+                "user": u, "sysadmin": bool(sa), "db_owner": bool(dbown),
+                "readonly_enforced": True, "policy": READONLY_POLICY,
+            }
+            if sa or dbown:
+                result["db_account"]["warning"] = (
+                    "当前账号具备写库权限，本 MCP 仍强制只读；改数请走 OA/DMS 正式流程")
+        except Exception as exc:  # noqa: BLE001
+            result["db_account"] = {"error": str(exc)[:120], "policy": READONLY_POLICY}
         result["advice"] = ("正常，可以取数" if result["tunnels"]
                             else "正常（未检测到本机 VPN 隧道，走了路由器/旁路由转发）")
+        if result.get("db_account", {}).get("warning"):
+            result["advice"] += "｜" + result["db_account"]["warning"]
         try:
             chk = check_office_changes(3)
             result["office_changes"] = {
