@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-lq-flow 懒人包安装器（无交互）
+lq-flow 一键安装器（无交互）
 
 做四件事：
   1. 安装 Python 依赖
-  2. 把包内的 .lq-flow.env 复制到用户目录（600 权限）
+  2. 准备数据库配置：已有 ~/.lq-flow.env 就沿用，没有就进配置向导（setup.py）
   3. 自动检测并注册到已安装的 Agent 客户端（ZCode / Claude Desktop / Cursor）
   4. 做一次连通性检查并打印结果
 
@@ -156,7 +156,7 @@ def check_conn() -> None:
 
 def main() -> int:
     line("=" * 52)
-    line(" 漓泉 cERP MCP 懒人安装")
+    line(" 漓泉 cERP MCP 一键安装")
     line("=" * 52)
     if not ensure_deps():
         return 1

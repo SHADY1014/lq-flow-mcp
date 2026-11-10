@@ -254,7 +254,7 @@ def print_lockout_help() -> None:
     print("\n结论：这个共享账号很可能已经被多次失败试锁了（18456 常见于此）。")
     print("  1. 停止继续尝试，等 15 分钟再试；")
     print("  2. 或让 DBA 解锁：ALTER LOGIN [erp] WITH PASSWORD = '<原密码>'；")
-    print("  3. 最省事的办法：找发放人拿「懒人包」，里面已带可用账号，安装时零输入。")
+    print("  3. 或找已经装好的同事当面拷一份 ~/.lq-flow.env（用完改密码）。")
 
 
 # ------------------------------------------------------------------ 主流程
@@ -363,8 +363,8 @@ def main() -> int:
             items = uniq
         if not items:
             print("  仍未找到可用的明文配置。下一步二选一：")
-            print("    1) 向发放人要「懒人包」（包内已带账号，零输入）")
-            print("    2) 找 IT/DBA 要 lqerp 的只读数据库账号")
+            print("    1) 找 IT/DBA 要 lqerp 的只读数据库账号")
+            print("    2) 让已装好的同事当面拷一份 ~/.lq-flow.env（用完改密码）")
             print("  也可用 --ini 指定某个 hjapp1.ini 路径。")
     else:
         print(f"\n[2/4] 扫描到 {len(items)} 条连接信息")
