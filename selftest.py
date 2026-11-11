@@ -64,7 +64,19 @@ def main() -> int:
 
     check("refresh_catalog('web') 优雅降级", web_no_nameerror)
 
-    print("[3] 数据库与字符集")
+    print("[3] 一期 ERP 菜单目录")
+
+    def erp1_ok():
+        items = server._scan_erp1_catalog()
+        if len(items) < 800:
+            raise AssertionError(f"一期菜单偏少: {len(items)}")
+        bad = [x for x in items if x.get("库") != "lqylerp"]
+        if bad:
+            raise AssertionError(f"一期条目的库标记不是 lqylerp: {bad[0]}")
+
+    check("一期菜单扫描（lqylerp.ctlm0011）", erp1_ok)
+
+    print("[4] 数据库与字符集")
 
     def db_reachable():
         pf = server.preflight()
@@ -84,7 +96,7 @@ def main() -> int:
 
     check("varchar 中文解码（GBK）", charset_ok)
 
-    print("[4] 导出防误导")
+    print("[5] 导出防误导")
 
     def guard_ok():
         r = server.export_catalog_table("saft04", "不存在的报表名", preview_only=True, allow_fuzzy=True)

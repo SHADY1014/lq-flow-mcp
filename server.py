@@ -762,7 +762,7 @@ def _catalog_raw() -> dict:
 def _load_catalog() -> list[dict]:
     data = _catalog_raw()
     return (list(data.get("db") or []) + list(data.get("erp") or [])
-            + list(data.get("web") or []))
+            + list(data.get("erp1") or []) + list(data.get("web") or []))
 
 
 def _resolve_obj(tid: str, objs: list[str], procs: set[str], curated: dict):
@@ -865,6 +865,56 @@ def _scan_erp_catalog() -> list[dict]:
     return out
 
 
+def _scan_erp1_catalog() -> list[dict]:
+    """一期 ERP（lqylerp，与 lqerp 同实例 .19）的菜单目录。
+
+    一期没有 hjappmenu：菜单在 ctlm0011，字段是
+    id_menu / name_menu / model_window / var_parm，
+    底表 id 放在 var_parm（如 acmake、ctlm1007、proc_xxx）。
+    """
+    conn = _connect(database="lqylerp", timeout=900)
+    cur = conn.cursor()
+    try:
+        cur.execute("""select rtrim(isnull(id_menu,'')), rtrim(name_menu),
+                              rtrim(isnull(var_parm,'')), rtrim(isnull(model_window,''))
+                       from ctlm0011""")
+        menus = cur.fetchall()
+        cur.execute("select rtrim(name) from sys.tables")
+        tables = {r[0] for r in cur.fetchall()}
+        cur.execute("select rtrim(name) from sys.views")
+        views = {r[0] for r in cur.fetchall()}
+        cur.execute("select rtrim(name) from sys.procedures")
+        procs = {r[0] for r in cur.fetchall()}
+    finally:
+        conn.close()
+
+    objs = sorted(tables | views)
+    out = []
+    for mid, name, tid, win in menus:
+        tid = (tid or "").strip()
+        win = (win or "").strip()
+        if tid:
+            kind, src, how = _resolve_obj(tid, objs, procs, {})
+        else:
+            # 一期窗口名多为 w_app_<描述>，不对应表名，不做推断
+            kind, src, how = "datawindow", None, "—"
+        if kind == "datawindow" and not src:
+            continue
+        row = {"menu_id": mid, "报表名称": (name or "").strip(),
+               "table_id": tid or (src or ""), "窗口": win,
+               "类型": kind, "数据源": src, "匹配方式": how,
+               "来源": "ERP一期", "库": "lqylerp"}
+        # 一期是分期间表（acinv_03/_06/_07），非精确命中时把同类表都列出来，
+        # 避免调用方误以为 data源 就是唯一/当前期间。
+        if tid and how != "精确":
+            key = tid[2:] if tid.startswith("d_") else tid
+            cands = sorted({o for o in objs if key and key in o})
+            if len(cands) > 1:
+                row["候选"] = cands[:12]
+        out.append(row)
+    return out
+
+
 def _scan_web_catalog() -> list[dict]:
     """从 DMS 网页版菜单接口生成目录（需要 dms_login.py 的会话）。"""
     import urllib.request
@@ -901,7 +951,8 @@ def _scan_web_catalog() -> list[dict]:
 def refresh_catalog(sources: str = "all") -> dict:
     """从系统实时拉取报表目录并缓存到本机（不再随仓库分发）。
 
-    sources: all / db / web。db 需要数据库账号，web 需要 dms_login.py 的会话。
+    sources: all / db / erp / erp1 / web。db 需要数据库账号，web 需要 dms_login.py 的会话。
+    一期（erp1）读 lqylerp.ctlm0011，三期（erp）读 lqerp.hjappmenu。
     """
     data = _catalog_raw()
     result = {"ok": True, "path": str(CATALOG_FILE)}
@@ -927,8 +978,16 @@ def refresh_catalog(sources: str = "all") -> dict:
         except Exception as exc:  # noqa: BLE001
             result["web_error"] = str(exc)[:200]
 
+    if sources in ("all", "erp1"):
+        try:
+            erp1_items = _scan_erp1_catalog()
+            data["erp1"] = erp1_items
+            result["erp1_count"] = len(erp1_items)
+        except Exception as exc:  # noqa: BLE001
+            result["erp1_error"] = str(exc)[:200]
+
     data["updated_at"] = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    if data.get("db") or data.get("web"):
+    if data.get("db") or data.get("erp") or data.get("erp1") or data.get("web"):
         CATALOG_FILE.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
         os.chmod(CATALOG_FILE, 0o600)
         result["ok"] = True
@@ -988,19 +1047,27 @@ def report_detail(name_or_id: str) -> dict:
     out = {"ok": True, **item, "可信度": _confidence(item)}
     src = item.get("数据源")
     if item.get("类型") == "table" and src:
-        conn = _connect(timeout=300)
-        cur = conn.cursor()
-        try:
-            if item.get("库") == "lqerp":
-                cur.execute("select c.name from sys.columns c where c.object_id=OBJECT_ID(%s) order by c.column_id", (src,))
-            else:
+        db = (item.get("库") or "").strip()
+        if db in ("lqerp", "lqylerp"):
+            conn = _connect(database=db, timeout=300)
+            cur = conn.cursor()
+            try:
+                cur.execute("select c.name from sys.columns c "
+                            "where c.object_id=OBJECT_ID(%s) order by c.column_id", (src,))
+                out["columns"] = [r[0] for r in cur.fetchall()]
+            finally:
+                conn.close()
+        else:
+            conn = _connect(timeout=300)
+            cur = conn.cursor()
+            try:
                 cur.execute(
                     "select c.name from lqcerp_lnk.lqcerp.sys.columns c "
                     "join lqcerp_lnk.lqcerp.sys.objects o on c.object_id=o.object_id "
                     "where o.name=%s order by c.column_id", (src,))
-            out["columns"] = [r[0] for r in cur.fetchall()]
-        finally:
-            conn.close()
+                out["columns"] = [r[0] for r in cur.fetchall()]
+            finally:
+                conn.close()
     return out
 
 
@@ -1055,20 +1122,21 @@ def export_catalog_table(table_id: str, expect_name: str, where: str = "",
         cond = _check_fragment(where, "where ")
     except ValueError as exc:
         return {"ok": False, "error": str(exc)}
-    table_ref = (f"[{src}]" if item.get("库") == "lqerp"
+    table_ref = (f"[{src}]" if item.get("库") in ("lqerp", "lqylerp")
                  else f"lqcerp_lnk.lqcerp.dbo.[{src}]")
     base = f"select * from {table_ref} with(nolock)"
     if cond:
         base += " where " + cond
+    src_db = item.get("库") if item.get("库") in ("lqerp", "lqylerp") else None
 
-    cols, rows, _ = _query_readonly(base, 3)
+    cols, rows, _ = _query_readonly(base, 3, src_db)
     preview = [[_jsonable(v) for v in r] for r in rows]
 
     if preview_only:
         return {"ok": True, "preview_only": True, "报表名称": item.get("报表名称"),
                 "数据源": src, "可信度": conf, "columns": cols, "rows": preview}
 
-    cols, rows, trunc = _query_readonly(base, limit)
+    cols, rows, trunc = _query_readonly(base, limit, src_db)
     if not out_path:
         return {"ok": False, "error": "out_path 必填", "rows": len(rows)}
     path = _write_xlsx(Path(out_path).expanduser(), cols, rows, sheet, total_row)

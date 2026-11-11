@@ -246,10 +246,19 @@ oa_flow_list(2036, status=2)   # 2=在办，返回单号/发起人/当前处理�
 |---|---|---|
 | 经销商库 lqcerp | `refresh_catalog("db")`：扫 `hjappmenu` + 系统对象 | 657 |
 | **ERP 三期 lqerp** | `refresh_catalog("erp")`：本机 `.19` 的 `hjappmenu`（2300+ 菜单） | 2162 |
+| **ERP 一期 lqylerp** | `refresh_catalog("erp1")`：本机 `.19` 的 `ctlm0011`（菜单表） | 939 |
 | DMS 网页版 | `refresh_catalog("web")`：调 `MenuServlet`（需 dms_login.py） | 99 |
 
-每个条目带 `库` 字段（`lqcerp` / `lqerp`），导出时自动走对应的库：
-`lqcerp` 通过链接服务器 `lqcerp_lnk`，`lqerp` 走本机连接。
+每个条目带 `库` 字段（`lqcerp` / `lqerp` / `lqylerp`），导出时自动走对应的库：
+`lqcerp` 通过链接服务器 `lqcerp_lnk`，`lqerp` / `lqylerp` 走本机连接。
+
+> **一期特别注意**：一期的菜单把底表 id 放在 `var_parm`，而实际表是分期间的
+> （`acinv_03` 历史、`acinv_07` 当前）。只要不是精确命中，条目会带 `候选` 字段，
+> 且 `可信度` 为低，默认不允许导出——必须显式传 `allow_fuzzy=True` 并确认期间表。
+
+一期客户端（`hjerp 一期.exe`，2019 年打包）的 `hjsoft.ini` 里有三段连接配置：
+`[Database]`=lqdrp、`[liquan]`=lqerp、`[n9lqnerp]`=192.168.199.51/n9lqnerp。
+其中 `.51` 当前网络不可达，所以一期只接入 `.19` 上的 `lqylerp`。
 
 | 类型 | 数量 | 含义 |
 |---|---|---|
